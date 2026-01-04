@@ -1,0 +1,23 @@
+{
+  "name": "zclaim-relay",
+  "version": "0.1.0",
+  "description": "ZCLAIM Relay Service - Zcash block header relayer to Starknet",
+  "type": "module",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js",
+    "dev": "node --watch src/index.js",
+    "test": "node --test tests/"
+  },
+  "dependencies": {
+    "starknet": "^6.11.0",
+    "dotenv": "^16.4.5",
+    "axios": "^1.6.8",
+    "blake2": "^5.0.0",
+    "pino": "^8.19.0",
+    "pino-pretty": "^11.0.0"
+  },
+  "devDependencies": {
+    "eslint": "^8.57.0"
+  }
+}

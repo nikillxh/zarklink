@@ -1,0 +1,17 @@
+{
+  "name": "zclaim-circuits",
+  "version": "0.1.0",
+  "description": "ZCLAIM circom circuits for Zcash bridge",
+  "scripts": {
+    "compile:blake2b": "circom tests/circuits/main_blake2b.circom --r1cs --wasm -o build/",
+    "compile:example": "circom circuits/example.circom --r1cs --wasm -o build/",
+    "compile:all": "npm run compile:blake2b",
+    "test": "node tests/blake2b_check.js"
+  },
+  "dependencies": {
+    "circomlib": "^2.0.5"
+  },
+  "devDependencies": {
+    "snarkjs": "^0.7.0"
+  }
+}
