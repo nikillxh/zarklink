@@ -1,0 +1,419 @@
+#!/usr/bin/env bash
+# ============================================================================
+# Zarklink — Contract Deployment Script
+# ============================================================================
+# Compiles Cairo contracts with Scarb and deploys them to the local
+# Starknet devnet. Saves deployed addresses to .devnet/deployments.json.
+#
+# Usage:
+#   ./scripts/deploy.sh            # Build + deploy all contracts
+#   ./scripts/deploy.sh build      # Build only (scarb build)
+#   ./scripts/deploy.sh deploy     # Deploy only (assumes already built)
+# ============================================================================
+
+set -euo pipefail
+
+PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+CONTRACTS_DIR="${PROJECT_ROOT}/contracts"
+DATA_DIR="${PROJECT_ROOT}/.devnet"
+ENV_FILE="${PROJECT_ROOT}/.env.devnet"
+DEPLOYMENTS_FILE="${DATA_DIR}/deployments.json"
+
+# Colors
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+CYAN='\033[0;36m'
+NC='\033[0m'
+BOLD='\033[1m'
+
+log_info()    { echo -e "${CYAN}[INFO]${NC}  $*"; }
+log_success() { echo -e "${GREEN}[OK]${NC}    $*"; }
+log_error()   { echo -e "${RED}[ERR]${NC}   $*"; }
+log_header()  { echo -e "\n${BOLD}${BLUE}═══ $* ═══${NC}\n"; }
+
+# ---------------------------------------------------------------------------
+# Load environment
+# ---------------------------------------------------------------------------
+load_env() {
+  if [ ! -f "${ENV_FILE}" ]; then
+    log_error "Environment file not found: ${ENV_FILE}"
+    log_error "Run ./scripts/start-devnet.sh first"
+    exit 1
+  fi
+  set -a
+  source "${ENV_FILE}"
+  set +a
+  log_success "Loaded environment from ${ENV_FILE}"
+}
+
+# ---------------------------------------------------------------------------
+# Build contracts
+# ---------------------------------------------------------------------------
+build_contracts() {
+  log_header "Building Cairo Contracts"
+  cd "${CONTRACTS_DIR}"
+
+  if [ ! -f "Scarb.toml" ]; then
+    log_error "No Scarb.toml found in ${CONTRACTS_DIR}"
+    exit 1
+  fi
+
+  scarb build
+  log_success "Contracts compiled successfully"
+
+  # List compiled artifacts
+  log_info "Compiled artifacts:"
+  ls -la "${CONTRACTS_DIR}/target/dev/" 2>/dev/null || log_info "  (no artifacts yet)"
+  cd "${PROJECT_ROOT}"
+}
+
+# ---------------------------------------------------------------------------
+# Declare + Deploy a contract
+# ---------------------------------------------------------------------------
+declare_and_deploy() {
+  local contract_name=$1
+  shift
+  local constructor_args=("$@")
+
+  local sierra_file="${CONTRACTS_DIR}/target/dev/zarklink_${contract_name}.contract_class.json"
+  local casm_file="${CONTRACTS_DIR}/target/dev/zarklink_${contract_name}.compiled_contract_class.json"
+
+  if [ ! -f "$sierra_file" ]; then
+    log_error "Sierra file not found: ${sierra_file}"
+    return 1
+  fi
+
+  log_info "Declaring ${contract_name}..."
+  local declare_output
+  declare_output=$(starkli declare \
+    --rpc "${STARKNET_RPC_URL}" \
+    --account "${DATA_DIR}/starkli-account.json" \
+    --keystore "${DATA_DIR}/starkli-keystore.json" \
+    --keystore-password "" \
+    "${sierra_file}" \
+    --casm-file "${casm_file}" \
+    2>&1 || true)
+
+  local class_hash
+  class_hash=$(echo "$declare_output" | grep -oP '0x[0-9a-fA-F]+' | head -1 || echo "")
+
+  if [ -z "$class_hash" ]; then
+    # May already be declared
+    class_hash=$(echo "$declare_output" | grep -oP 'already declared.*?(0x[0-9a-fA-F]+)' | grep -oP '0x[0-9a-fA-F]+' || echo "")
+    if [ -n "$class_hash" ]; then
+      log_info "  Already declared: ${class_hash}"
+    else
+      log_error "  Failed to declare ${contract_name}: ${declare_output}"
+      return 1
+    fi
+  else
+    log_success "  Declared: ${class_hash}"
+  fi
+
+  log_info "Deploying ${contract_name}..."
+  local deploy_output
+  deploy_output=$(starkli deploy \
+    --rpc "${STARKNET_RPC_URL}" \
+    --account "${DATA_DIR}/starkli-account.json" \
+    --keystore "${DATA_DIR}/starkli-keystore.json" \
+    --keystore-password "" \
+    "${class_hash}" \
+    "${constructor_args[@]}" \
+    2>&1 || true)
+
+  local contract_address
+  contract_address=$(echo "$deploy_output" | grep -oP '0x[0-9a-fA-F]+' | tail -1 || echo "")
+
+  if [ -n "$contract_address" ]; then
+    log_success "  Deployed ${contract_name} at: ${contract_address}"
+    echo "{\"${contract_name}\": {\"class_hash\": \"${class_hash}\", \"address\": \"${contract_address}\"}}"
+  else
+    log_error "  Failed to deploy ${contract_name}: ${deploy_output}"
+    return 1
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# Setup starkli account for deployment
+# ---------------------------------------------------------------------------
+setup_starkli() {
+  log_header "Setting Up Starkli Deployer Account"
+
+  local deployer_pk deployer_addr
+
+  if [ -f "${DATA_DIR}/starknet-accounts.json" ]; then
+    deployer_pk=$(python3 -c "import json; d=json.load(open('${DATA_DIR}/starknet-accounts.json')); print(d[0]['private_key'])")
+    deployer_addr=$(python3 -c "import json; d=json.load(open('${DATA_DIR}/starknet-accounts.json')); print(d[0]['address'])")
+  else
+    log_error "No Starknet accounts found. Run start-devnet.sh first."
+    exit 1
+  fi
+
+  # Create keystore
+  if [ ! -f "${DATA_DIR}/starkli-keystore.json" ]; then
+    echo -n "" | starkli signer keystore from-key \
+      "${DATA_DIR}/starkli-keystore.json" \
+      --private-key "${deployer_pk}" \
+      --password "" 2>/dev/null || true
+
+    # Alternative: just store the raw key
+    if [ ! -f "${DATA_DIR}/starkli-keystore.json" ]; then
+      mkdir -p "${DATA_DIR}"
+      echo "${deployer_pk}" > "${DATA_DIR}/deployer-private-key.txt"
+    fi
+  fi
+
+  # Create account descriptor for devnet predeployed accounts (OZ 0.8.1)
+  cat > "${DATA_DIR}/starkli-account.json" <<EOF
+{
+  "version": 1,
+  "variant": {
+    "type": "open_zeppelin",
+    "version": 1,
+    "public_key": "auto"
+  },
+  "deployment": {
+    "status": "deployed",
+    "class_hash": "0x061dac032f228abef9c6626f995015233097ae253a7f72d68552db02f2971b8f",
+    "address": "${deployer_addr}"
+  }
+}
+EOF
+
+  log_success "Starkli account configured (${deployer_addr})"
+}
+
+# ---------------------------------------------------------------------------
+# Helper: invoke a contract function post-deploy
+# ---------------------------------------------------------------------------
+invoke_contract() {
+  local contract_addr=$1
+  local function_name=$2
+  shift 2
+  local call_args=("$@")
+
+  log_info "  Invoking ${function_name} on ${contract_addr:0:10}..."
+  starkli invoke \
+    --rpc "${STARKNET_RPC_URL}" \
+    --account "${DATA_DIR}/starkli-account.json" \
+    --keystore "${DATA_DIR}/starkli-keystore.json" \
+    --keystore-password "" \
+    "${contract_addr}" \
+    "${function_name}" \
+    "${call_args[@]}" \
+    2>&1 || { log_error "  invoke ${function_name} failed"; return 1; }
+
+  log_success "  ${function_name} called"
+}
+
+# ---------------------------------------------------------------------------
+# Deploy all protocol contracts
+# ---------------------------------------------------------------------------
+deploy_all() {
+  log_header "Deploying Zarklink Protocol Contracts"
+
+  load_env
+  setup_starkli
+
+  mkdir -p "${DATA_DIR}"
+
+  # Read deployer address
+  local deployer_addr
+  deployer_addr=$(python3 -c "import json; d=json.load(open('${DATA_DIR}/starknet-accounts.json')); print(d[0]['address'])")
+
+  log_info "Deployer: ${deployer_addr}"
+  log_info "Deployment order:"
+  echo "  1. wZEC Token"
+  echo "  2. Exchange Rate Oracle"
+  echo "  3. Vault Registry"
+  echo "  4. Zcash Relay"
+  echo "  5. Bridge Protocol"
+  echo "  6. Vault Pool"
+  echo ""
+
+  # ── 1. wZEC Token ──────────────────────────────────────────────────────────
+  log_header "1/6 — wZEC Token"
+  # Constructor: owner (ContractAddress), bridge (ContractAddress)
+  # Bridge address not known yet — deploy with owner as bridge, update later
+  local wzec_result
+  wzec_result=$(declare_and_deploy "WzecToken" "${deployer_addr}" "${deployer_addr}")
+  local WZEC_ADDR
+  WZEC_ADDR=$(echo "$wzec_result" | python3 -c "import json,sys; print(json.load(sys.stdin)['WzecToken']['address'])")
+  log_success "wZEC Token: ${WZEC_ADDR}"
+
+  # ── 2. Exchange Rate Oracle ────────────────────────────────────────────────
+  log_header "2/6 — Exchange Rate Oracle"
+  # Constructor: owner (ContractAddress)
+  local oracle_result
+  oracle_result=$(declare_and_deploy "ExchangeRateOracle" "${deployer_addr}")
+  local ORACLE_ADDR
+  ORACLE_ADDR=$(echo "$oracle_result" | python3 -c "import json,sys; print(json.load(sys.stdin)['ExchangeRateOracle']['address'])")
+  log_success "Oracle: ${ORACLE_ADDR}"
+
+  # ── 3. Vault Registry ─────────────────────────────────────────────────────
+  log_header "3/6 — Vault Registry"
+  # Constructor: owner (ContractAddress), min_collateral (u256 = low + high),
+  #              collateral_ratio (u32)
+  # min_collateral = 1 ZEC = 100_000_000 zatoshi
+  # collateral_ratio = 15000 (150%)
+  local min_collateral_low="100000000"
+  local min_collateral_high="0"
+  local collateral_ratio="15000"
+  local registry_result
+  registry_result=$(declare_and_deploy "VaultRegistry" \
+    "${deployer_addr}" \
+    "${min_collateral_low}" "${min_collateral_high}" \
+    "${collateral_ratio}")
+  local REGISTRY_ADDR
+  REGISTRY_ADDR=$(echo "$registry_result" | python3 -c "import json,sys; print(json.load(sys.stdin)['VaultRegistry']['address'])")
+  log_success "Vault Registry: ${REGISTRY_ADDR}"
+
+  # ── 4. Zcash Relay ────────────────────────────────────────────────────────
+  log_header "4/6 — Zcash Relay"
+  # Constructor: owner (ContractAddress), finality_depth (u32)
+  local finality_depth="6"
+  local relay_result
+  relay_result=$(declare_and_deploy "ZcashRelay" \
+    "${deployer_addr}" \
+    "${finality_depth}")
+  local RELAY_ADDR
+  RELAY_ADDR=$(echo "$relay_result" | python3 -c "import json,sys; print(json.load(sys.stdin)['ZcashRelay']['address'])")
+  log_success "Zcash Relay: ${RELAY_ADDR}"
+
+  # ── 5. Bridge Protocol ────────────────────────────────────────────────────
+  log_header "5/6 — Bridge Protocol"
+  # Constructor: owner, vault_registry, vault_pool (not yet), zcash_relay, wzec_token
+  # vault_pool not deployed yet — use deployer as placeholder, update later
+  local bridge_result
+  bridge_result=$(declare_and_deploy "BridgeProtocol" \
+    "${deployer_addr}" \
+    "${REGISTRY_ADDR}" \
+    "${deployer_addr}" \
+    "${RELAY_ADDR}" \
+    "${WZEC_ADDR}")
+  local BRIDGE_ADDR
+  BRIDGE_ADDR=$(echo "$bridge_result" | python3 -c "import json,sys; print(json.load(sys.stdin)['BridgeProtocol']['address'])")
+  log_success "Bridge Protocol: ${BRIDGE_ADDR}"
+
+  # ── 6. Vault Pool ─────────────────────────────────────────────────────────
+  log_header "6/6 — Vault Pool"
+  # Constructor: owner (ContractAddress), registry (ContractAddress)
+  local pool_result
+  pool_result=$(declare_and_deploy "VaultPool" \
+    "${deployer_addr}" \
+    "${REGISTRY_ADDR}")
+  local POOL_ADDR
+  POOL_ADDR=$(echo "$pool_result" | python3 -c "import json,sys; print(json.load(sys.stdin)['VaultPool']['address'])")
+  log_success "Vault Pool: ${POOL_ADDR}"
+
+  # ── Post-deploy configuration ─────────────────────────────────────────────
+  log_header "Post-Deploy Configuration"
+
+  # 1. Set bridge protocol on wZEC Token (so bridge can mint/burn)
+  invoke_contract "${WZEC_ADDR}" "set_bridge" "${BRIDGE_ADDR}" || true
+
+  # 2. Set bridge protocol on vault registry
+  invoke_contract "${REGISTRY_ADDR}" "set_bridge_protocol" "${BRIDGE_ADDR}" || true
+
+  # 3. Set bridge protocol on vault pool
+  invoke_contract "${POOL_ADDR}" "set_bridge_protocol" "${BRIDGE_ADDR}" || true
+
+  # 4. Authorize deployer as relayer on zcash relay
+  invoke_contract "${RELAY_ADDR}" "authorize_relayer" "${deployer_addr}" || true
+
+  # 5. Set fee rate (30 bps = 0.3%)
+  invoke_contract "${BRIDGE_ADDR}" "set_fee_rate" "30" || true
+
+  # 6. Set warranty amount (0.1 ZEC = 10_000_000 zatoshi)
+  invoke_contract "${BRIDGE_ADDR}" "set_warranty_amount" "10000000" "0" || true
+
+  log_success "Post-deploy configuration complete"
+
+  # ── Save deployments ───────────────────────────────────────────────────────
+  log_header "Saving Deployment Addresses"
+
+  cat > "${DEPLOYMENTS_FILE}" <<DEPL
+{
+  "network": "devnet",
+  "deployer": "${deployer_addr}",
+  "contracts": {
+    "wzec_token": {
+      "address": "${WZEC_ADDR}",
+      "name": "WzecToken"
+    },
+    "oracle": {
+      "address": "${ORACLE_ADDR}",
+      "name": "ExchangeRateOracle"
+    },
+    "vault_registry": {
+      "address": "${REGISTRY_ADDR}",
+      "name": "VaultRegistry"
+    },
+    "zcash_relay": {
+      "address": "${RELAY_ADDR}",
+      "name": "ZcashRelay"
+    },
+    "bridge_protocol": {
+      "address": "${BRIDGE_ADDR}",
+      "name": "BridgeProtocol"
+    },
+    "vault_pool": {
+      "address": "${POOL_ADDR}",
+      "name": "VaultPool"
+    }
+  }
+}
+DEPL
+
+  log_success "Deployments saved to ${DEPLOYMENTS_FILE}"
+
+  # ── Update .env.devnet with deployed addresses ─────────────────────────────
+  log_header "Updating .env.devnet"
+
+  # Remove old address lines and append new ones
+  sed -i '/^WZEC_TOKEN_ADDRESS=/d' "${ENV_FILE}" 2>/dev/null || true
+  sed -i '/^ORACLE_ADDRESS=/d' "${ENV_FILE}" 2>/dev/null || true
+  sed -i '/^VAULT_REGISTRY_ADDRESS=/d' "${ENV_FILE}" 2>/dev/null || true
+  sed -i '/^ZCASH_RELAY_ADDRESS=/d' "${ENV_FILE}" 2>/dev/null || true
+  sed -i '/^BRIDGE_PROTOCOL_ADDRESS=/d' "${ENV_FILE}" 2>/dev/null || true
+  sed -i '/^VAULT_POOL_ADDRESS=/d' "${ENV_FILE}" 2>/dev/null || true
+
+  cat >> "${ENV_FILE}" <<ENVADDRS
+
+# ── Deployed Contract Addresses (auto-generated by deploy.sh) ──
+WZEC_TOKEN_ADDRESS=${WZEC_ADDR}
+ORACLE_ADDRESS=${ORACLE_ADDR}
+VAULT_REGISTRY_ADDRESS=${REGISTRY_ADDR}
+ZCASH_RELAY_ADDRESS=${RELAY_ADDR}
+BRIDGE_PROTOCOL_ADDRESS=${BRIDGE_ADDR}
+VAULT_POOL_ADDRESS=${POOL_ADDR}
+ENVADDRS
+
+  log_success ".env.devnet updated with contract addresses"
+
+  # ── Summary ────────────────────────────────────────────────────────────────
+  log_header "Deployment Summary"
+  echo -e "  ${BOLD}wZEC Token:${NC}       ${WZEC_ADDR}"
+  echo -e "  ${BOLD}Oracle:${NC}           ${ORACLE_ADDR}"
+  echo -e "  ${BOLD}Vault Registry:${NC}   ${REGISTRY_ADDR}"
+  echo -e "  ${BOLD}Zcash Relay:${NC}      ${RELAY_ADDR}"
+  echo -e "  ${BOLD}Bridge Protocol:${NC}  ${BRIDGE_ADDR}"
+  echo -e "  ${BOLD}Vault Pool:${NC}       ${POOL_ADDR}"
+  echo ""
+  log_success "All contracts deployed and configured!"
+}
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+case "${1:-all}" in
+  build)    build_contracts ;;
+  deploy)   load_env; deploy_all ;;
+  all)      build_contracts; deploy_all ;;
+  *)
+    echo "Usage: $0 {build|deploy|all}"
+    exit 1
+    ;;
+esac

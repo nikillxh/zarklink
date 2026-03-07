@@ -1,0 +1,128 @@
+@import "tailwindcss";
+
+@source "../**/*.{ts,tsx}";
+
+@theme {
+  --color-background: #0A0E1A;
+  --color-foreground: #E5E7EB;
+  --color-brand-primary: #00D4AA;
+  --color-brand-blue: #2979FF;
+  --color-brand-green: #00E676;
+  --color-brand-dark: #0A0E1A;
+  --color-brand-card: #111827;
+  --color-brand-border: #1F2937;
+  --font-mono: var(--font-geist-mono), monospace;
+  --animate-pulse-slow: pulse 3s cubic-bezier(0.4, 0, 0.6, 1) infinite;
+  --animate-glow: glow 2s ease-in-out infinite alternate;
+}
+
+@keyframes glow {
+  0% { box-shadow: 0 0 5px rgba(0, 212, 170, 0.2); }
+  100% { box-shadow: 0 0 20px rgba(0, 212, 170, 0.4); }
+}
+
+:root {
+  --background: #0A0E1A;
+  --foreground: #E5E7EB;
+  --brand-primary: #00D4AA;
+  --brand-blue: #2979FF;
+  --brand-green: #00E676;
+}
+
+body {
+  color: var(--foreground);
+  background: var(--background);
+  font-family: var(--font-geist-sans), system-ui, sans-serif;
+}
+
+@utility text-gradient {
+  @apply bg-clip-text text-transparent bg-gradient-to-r from-brand-primary to-brand-blue;
+}
+
+@utility card {
+  @apply bg-brand-card border border-brand-border rounded-xl p-6;
+}
+
+@utility card-hover {
+  @apply bg-brand-card border border-brand-border rounded-xl p-6;
+  &:hover {
+    border-color: color-mix(in srgb, var(--color-brand-primary) 40%, transparent);
+  }
+  transition-property: color, background-color, border-color;
+  transition-duration: 200ms;
+}
+
+@utility btn-primary {
+  @apply bg-brand-primary text-brand-dark font-semibold px-6 py-3 rounded-lg;
+  &:hover { opacity: 0.9; }
+  transition: all 200ms;
+  &:disabled { opacity: 0.5; cursor: not-allowed; }
+}
+
+@utility btn-secondary {
+  @apply bg-transparent border border-brand-border text-foreground px-6 py-3 rounded-lg;
+  &:hover {
+    border-color: color-mix(in srgb, var(--color-brand-primary) 60%, transparent);
+    color: var(--color-brand-primary);
+  }
+  transition: all 200ms;
+}
+
+@utility input-field {
+  @apply bg-brand-dark border border-brand-border rounded-lg px-4 py-3 text-foreground;
+  &::placeholder { color: #6b7280; }
+  &:focus {
+    outline: none;
+    border-color: color-mix(in srgb, var(--color-brand-primary) 60%, transparent);
+    box-shadow: 0 0 0 1px color-mix(in srgb, var(--color-brand-primary) 30%, transparent);
+  }
+  transition-property: color, background-color, border-color;
+  transition-duration: 200ms;
+}
+
+@utility badge {
+  @apply inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium;
+}
+
+@utility badge-success {
+  @apply inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium;
+  background-color: rgb(20 83 45 / 0.5);
+  color: #4ade80;
+  border: 1px solid #166534;
+}
+
+@utility badge-warning {
+  @apply inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium;
+  background-color: rgb(113 63 18 / 0.5);
+  color: #facc15;
+  border: 1px solid #854d0e;
+}
+
+@utility badge-error {
+  @apply inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium;
+  background-color: rgb(127 29 29 / 0.5);
+  color: #f87171;
+  border: 1px solid #991b1b;
+}
+
+@utility badge-info {
+  @apply inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium;
+  background-color: rgb(30 58 138 / 0.5);
+  color: #60a5fa;
+  border: 1px solid #1e40af;
+}
+
+/* Custom scrollbar */
+::-webkit-scrollbar {
+  width: 6px;
+}
+::-webkit-scrollbar-track {
+  background: #0A0E1A;
+}
+::-webkit-scrollbar-thumb {
+  background: #1F2937;
+  border-radius: 3px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: #374151;
+}

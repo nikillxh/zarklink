@@ -1,0 +1,41 @@
+# Zarklink — .gitignore
+
+# Devnet state (regenerated on startup)
+.devnet/
+.env.devnet
+
+# Cairo build artifacts
+contracts/target/
+
+# Rust build artifacts
+prover/target/
+
+# Node.js
+node_modules/
+dist/
+.next/
+
+# Environment files
+.env
+.env.local
+.env.*.local
+
+# IDE
+.vscode/settings.json
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+logs/
+
+# Secrets
+*.pem
+*.key
+*-private-key.txt

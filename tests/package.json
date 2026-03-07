@@ -1,0 +1,27 @@
+{
+  "name": "@zarklink/integration-tests",
+  "version": "0.1.0",
+  "description": "Integration & E2E tests for Zarklink contracts via starknet.js",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "tsc --noEmit",
+    "test": "tsx src/run-all.ts",
+    "test:wzec": "tsx src/test-wzec.ts",
+    "test:oracle": "tsx src/test-oracle.ts",
+    "test:relay": "tsx src/test-relay.ts",
+    "test:registry": "tsx src/test-registry.ts",
+    "test:pool": "tsx src/test-pool.ts",
+    "test:e2e": "tsx src/test-e2e-flow.ts"
+  },
+  "dependencies": {
+    "starknet": "^9.2.1",
+    "dotenv": "^17.3.1",
+    "chalk": "^5.6.2"
+  },
+  "devDependencies": {
+    "typescript": "^5.9.3",
+    "tsx": "^4.21.0",
+    "@types/node": "^22.0.0"
+  }
+}
