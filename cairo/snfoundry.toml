@@ -1,5 +1,0 @@
-
-[sncast.zclaim_sepolia]
-account = "zclaim_sep"
-accounts-file = "/home/arnavpanjla/.starknet_accounts/starknet_open_zeppelin_accounts.json"
-url = ""
