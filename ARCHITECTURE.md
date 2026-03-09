@@ -288,9 +288,13 @@ neo-zarklink/
 │       │   ├── bridge/page.tsx    # /bridge — Issue & Redeem with devnet auto-completion
 │       │   ├── vaults/page.tsx    # /vaults — Vault registry browser (auto-refresh)
 │       │   ├── relay/page.tsx     # /relay — Zcash header relay status
+│       │   ├── dev/page.tsx       # /dev — Dev tools (Zcash, Starknet, simulations)
+│       │   ├── docs/page.tsx      # /docs — In-app protocol documentation
 │       │   ├── api/
-│       │   │   └── zcash-balance/
-│       │   │       └── route.ts   # GET /api/zcash-balance — proxies zcashd RPC
+│       │   │   ├── zcash-balance/
+│       │   │   │   └── route.ts   # GET /api/zcash-balance — proxies zcashd RPC
+│       │   │   └── dev/
+│       │   │       └── route.ts   # POST /api/dev — dev tools (mine, fund, etc.)
 │       │   ├── globals.css        # Tailwind CSS 4 + custom theme
 │       │   └── not-found.tsx      # 404 page
 │       ├── components/
@@ -683,6 +687,31 @@ With `NUM_VAULTS=8` (default), 15 predeployed accounts are allocated:
 | 12 | Oracle Service | Price feed updates |
 | 13–14 | Test Users | Additional test accounts |
 
+### 12.13 Dev Tools API & Zcash Regtest Quirks
+
+The dev tools API (`/api/dev`) wraps zcashd JSON-RPC calls with devnet-specific workarounds:
+
+- **`mine_blocks`**: Uses `generate` method (NOT `generatetoaddress`, which is unavailable in zcashd v6.x regtest).
+- **`fund_z_address`**: Uses `z_sendmany` with:
+  - **Privacy policy**: `NoPrivacy` (required for transparent→shielded with change on devnet).
+  - **Fee**: `null` (auto-calculated per ZIP 317; explicit low fees like 0.0001 fail with "unpaid action limit exceeded").
+  - **Coinbase UTXOs**: Cannot have change. The code prefers non-coinbase UTXOs and falls back to sending the full coinbase UTXO minus fee margin.
+- **`fund_t_address`**: Uses `sendtoaddress` (NOT `generatetoaddress`).
+- **Zcash regtest addresses**: Use `zregtestsapling1...` prefix, NOT `zs1...` (mainnet).
+
+### 12.14 Relay Seeding
+
+For Issue/Redeem to work, the relay contract needs finalized Zcash block headers.
+With `finality_depth=6`, at least 7 headers must be submitted for height 1 to be finalized.
+
+The dev page includes a "Seed Relay" button that:
+1. Queries current relay tip via `get_chain_tip()`
+2. Fetches Zcash block headers via `/api/dev?action=get_block_headers`
+3. Submits each header to the relay contract as the deployer (authorized relayer)
+4. The devnet fee estimator intermittently rejects transactions; some blocks may be skipped
+
+The deployer account is automatically authorized as a relayer during contract deployment.
+
 ---
 
 ## 13. Code Map
@@ -846,6 +875,48 @@ logic lives.
 ├─────────────────────────────────────────────────────────────────────┤
 │ app/relay/page.tsx                    Relay Status                  │
 │   Chain tip, finalized height, header count. Uses useRelayStats().  │
+├─────────────────────────────────────────────────────────────────────┤
+│ app/dev/page.tsx                      Dev Tools  (~870 lines)       │
+│   ┌─ Zcash Regtest Tools:                                          │
+│   │  Generate z-addr/t-addr, mine blocks, fund addresses           │
+│   │  Quick-fill vault shielded addresses, wallet info panel        │
+│   ├─ Starknet Contract Tools:                                       │
+│   │  Query all 5 contracts, wZEC balance scan, direct mint wZEC    │
+│   │  Seed Relay — submits Zcash headers to relay contract          │
+│   ├─ Simulation Scripts:                                            │
+│   │  Configurable count/amount, Run Nx Issue, Issue→Redeem Cycle   │
+│   │  Uses devnet auto-completion (vault operator impersonation)    │
+│   ├─ Devnet Accounts Reference — table of all 15 accounts          │
+│   └─ Console — timestamped log panel (info/success/error/pending)  │
+├─────────────────────────────────────────────────────────────────────┤
+│ app/docs/page.tsx                     Protocol Docs  (~534 lines)   │
+│   In-app protocol documentation with collapsible sections:          │
+│   ┌─ What is Zarklink? — overview, ZCLAIM reference                │
+│   ├─ Protocol Actors — 5 actors with devnet account mapping        │
+│   ├─ Issue Flow — 3-step with StepCard components                  │
+│   ├─ Redeem Flow — 2-step with details                             │
+│   ├─ Smart Contracts — all 6 contracts with function lists         │
+│   ├─ Vault System — lifecycle states, collateralization             │
+│   ├─ Zcash Relay — finality, inclusion proofs                      │
+│   ├─ Privacy & Splitting Strategy                                   │
+│   ├─ How to Use the Bridge — step-by-step instructions             │
+│   ├─ Architecture Overview — ASCII diagram                         │
+│   ├─ Troubleshooting — 6 common issues                             │
+│   └─ Quick Links — grid to Bridge, Vaults, Relay, Dev              │
+├─────────────────────────────────────────────────────────────────────┤
+│ app/api/dev/route.ts                  Dev Tools API                 │
+│   Server-side POST API for devnet Zcash operations:                │
+│   ┌─ generate_z_address — z_getnewaddress sapling                  │
+│   ├─ generate_t_address — getnewaddress                            │
+│   ├─ mine_blocks — generate (zcashd regtest)                       │
+│   ├─ fund_z_address — z_sendmany with auto fee (ZIP 317)          │
+│   │  Handles coinbase UTXOs (no change allowed)                    │
+│   ├─ fund_t_address — sendtoaddress                                │
+│   ├─ check_operation — z_getoperationstatus                        │
+│   ├─ get_block_headers — getblockheader (for relay seeding)        │
+│   ├─ wallet_info — getinfo + z_gettotalbalance + addresses         │
+│   └─ list_balances — z_getbalance for all shielded addresses       │
+│   Uses ZCASH_RPC_USER/PASS (server-only env vars)                  │
 └─────────────────────────────────────────────────────────────────────┘
 ```
 

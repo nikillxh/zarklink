@@ -2,7 +2,7 @@
 
 import Link from "next/link";
 import { usePathname } from "next/navigation";
-import { Zap, ArrowLeftRight, Shield, BarChart3, Radio } from "lucide-react";
+import { Zap, ArrowLeftRight, Shield, BarChart3, Radio, Wrench, BookOpen } from "lucide-react";
 import WalletConnector from "@/components/WalletConnector";
 
 const NAV_ITEMS = [
@@ -10,6 +10,8 @@ const NAV_ITEMS = [
   { href: "/bridge", label: "Bridge", icon: ArrowLeftRight },
   { href: "/vaults", label: "Vaults", icon: Shield },
   { href: "/relay", label: "Relay", icon: Radio },
+  { href: "/docs", label: "Docs", icon: BookOpen },
+  { href: "/dev", label: "Dev", icon: Wrench },
 ];
 
 export default function Navbar() {

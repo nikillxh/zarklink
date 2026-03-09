@@ -187,8 +187,15 @@ neo-zarklink/
 │
 ├── frontend/                  # Next.js web application
 │   └── src/
-│       ├── app/                     # Pages (dashboard, bridge, vaults, relay)
-│       │   └── api/zcash-balance/   # Server-side Zcash balance API route
+│       ├── app/                     # Pages
+│       │   ├── bridge/page.tsx      # /bridge — Issue & Redeem (auto-completion)
+│       │   ├── vaults/page.tsx      # /vaults — Vault browser
+│       │   ├── relay/page.tsx       # /relay — Relay status
+│       │   ├── dev/page.tsx         # /dev — Dev tools & simulations
+│       │   ├── docs/page.tsx        # /docs — Protocol documentation
+│       │   └── api/
+│       │       ├── zcash-balance/route.ts  # GET — Zcash balance proxy
+│       │       └── dev/route.ts     # POST — Dev tools (mine, fund, headers)
 │       ├── components/              # UI components (Navbar, WalletConnector, etc.)
 │       ├── context/                 # React contexts (Account, Wallet)
 │       ├── hooks/                   # Contract interaction hooks (auto-refresh)
@@ -564,7 +571,10 @@ Next.js 16.1.6 web application with React 19 and Tailwind CSS 4.
 | `/bridge` | Issue (ZEC → wZEC) and Redeem (wZEC → ZEC) with devnet auto-completion |
 | `/vaults` | Vault registry browser (auto-refreshes every 15s) |
 | `/relay` | Zcash header relay status |
-| `/api/zcash-balance` | Server-side API route — proxies zcashd RPC for balance queries |
+| `/docs` | In-app protocol documentation (collapsible sections, flow diagrams) |
+| `/dev` | Dev tools — Zcash regtest ops, Starknet contract tools, simulation scripts |
+| `/api/zcash-balance` | Server-side API — proxies zcashd RPC for balance queries |
+| `/api/dev` | Server-side API — dev tools (mine blocks, generate/fund addresses, relay seeding) |
 
 ### Bridge Page Features
 
@@ -575,6 +585,28 @@ Next.js 16.1.6 web application with React 19 and Tailwind CSS 4.
 - **Step-by-Step Status**: Displays progress messages during multi-step flows
 - **Friendly Errors**: Decodes hex contract errors into human-readable messages with hints
 - **Auto-Refresh**: Balances and contract data refresh on configurable intervals
+
+### Dev Tools Page (`/dev`)
+
+A comprehensive devnet toolkit accessible at `/dev`:
+
+- **Zcash Regtest Tools**: Generate shielded/transparent addresses, mine blocks, fund addresses
+  with quick-fill buttons for vault addresses
+- **Starknet Contract Tools**: Query all 5 contracts (Registry, Pool, Relay, Bridge, wZEC),
+  check wZEC balances across all accounts, direct-mint wZEC
+- **Seed Relay**: Submit Zcash block headers to the relay contract (required for Issue/Redeem)
+- **Simulation Scripts**: Run configurable multi-step protocol flows:
+  - `Run Nx Issue` — executes N full Issue flows (request_lock → submit_mint → confirm_issue)
+  - `Run Issue→Redeem Cycle` — full Issue then Redeem with vault operator impersonation
+- **Console Panel**: Timestamped log entries (info/success/error/pending)
+- **Devnet Accounts Reference**: Table of all 15 accounts with copy buttons
+
+### Docs Page (`/docs`)
+
+In-app protocol documentation with collapsible sections covering:
+protocol overview, actor roles, Issue/Redeem flows (step-by-step), smart contracts,
+vault system, Zcash relay, privacy splitting, usage instructions, architecture diagram,
+and troubleshooting guide.
 
 ### Wallet Connection
 
@@ -636,6 +668,20 @@ pnpm -C tests test
 8. Switch to **Redeem** tab, click **Max** to fill your wZEC balance, click **Redeem ZEC**
 9. Watch the step-by-step status: submit_burn → confirm_redeem
 10. Go to **Vaults** tab to see collateral and issued/redeemed amounts update (auto-refreshes)
+
+### Using Dev Tools
+
+1. Start the full stack (or just devnet + frontend)
+2. Go to http://localhost:3000/dev
+3. Click **Seed Relay (Submit Zcash Headers)** — submits Zcash block headers to the relay contract
+   (required before Issue/Redeem will work, as the relay needs finalized blocks)
+4. Use **Mine Blocks** to generate new zcashd blocks
+5. Use **Fund Z-Address** / **Fund T-Address** to send ZEC to addresses
+6. Use **Query All Contracts** to inspect Starknet contract state
+7. Run simulation scripts to execute multi-step Issue/Redeem flows with one click
+
+> **Note**: The relay needs at least 7 submitted headers for height 1 to be finalized
+> (finality depth = 6). Click **Seed Relay** before running simulations.
 
 > **Note:** On devnet, the frontend auto-completes all protocol steps (including vault
 > operator confirmations) without needing the vault daemon. See
