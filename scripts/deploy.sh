@@ -31,6 +31,15 @@ log_success() { echo -e "${GREEN}[OK]${NC}    $*"; }
 log_error()   { echo -e "${RED}[ERR]${NC}   $*"; }
 log_header()  { echo -e "\n${BOLD}${BLUE}═══ $* ═══${NC}\n"; }
 
+# Detect package manager (pnpm if lockfile exists, else npm)
+detect_pkg_manager() {
+  if [ -f "${PROJECT_ROOT}/pnpm-lock.yaml" ] && command -v pnpm &>/dev/null; then
+    echo "pnpm"
+  else
+    echo "npm"
+  fi
+}
+
 build_contracts() {
   log_header "Building Cairo Contracts"
   cd "${CONTRACTS_DIR}"
@@ -42,10 +51,15 @@ build_contracts() {
 deploy_contracts() {
   log_header "Deploying Contracts via starknet.js"
 
-  # Use tsx from the relayer package (or global npx)
+  local pm
+  pm=$(detect_pkg_manager)
+
+  # Use tsx from the relayer package (or global npx/pnpm exec)
   local tsx_bin=""
   if [ -x "${RELAYER_DIR}/node_modules/.bin/tsx" ]; then
     tsx_bin="${RELAYER_DIR}/node_modules/.bin/tsx"
+  elif [ "$pm" = "pnpm" ]; then
+    tsx_bin="pnpm exec tsx"
   else
     tsx_bin="npx tsx"
   fi

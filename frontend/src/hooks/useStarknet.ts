@@ -148,34 +148,39 @@ export interface PoolStats {
   capacity: bigint;
 }
 
-export function usePoolStats() {
+export function usePoolStats(refreshMs = 0) {
   const [stats, setStats] = useState<PoolStats | null>(null);
   const [loading, setLoading] = useState(true);
 
-  useEffect(() => {
-    async function load() {
-      try {
-        const provider = getProvider();
-        if (!starknetConfig.poolAddress) return;
-        const pool = new Contract({ abi: POOL_ABI, address: starknetConfig.poolAddress, providerOrAccount: provider });
-        const [size, cap] = await Promise.all([
-          pool.call("get_pool_size", []),
-          pool.call("get_pool_capacity", []),
-        ]);
-        setStats({
-          poolSize: Number(size),
-          capacity: BigInt(String(cap ?? 0)),
-        });
-      } catch {
-        // Not deployed
-      } finally {
-        setLoading(false);
-      }
+  const fetchStats = useCallback(async () => {
+    try {
+      const provider = getProvider();
+      if (!starknetConfig.poolAddress) return;
+      const pool = new Contract({ abi: POOL_ABI, address: starknetConfig.poolAddress, providerOrAccount: provider });
+      const [size, cap] = await Promise.all([
+        pool.call("get_active_vault_count", []),
+        pool.call("get_pool_capacity", []),
+      ]);
+      setStats({
+        poolSize: Number(size),
+        capacity: BigInt(String(cap ?? 0)),
+      });
+    } catch {
+      // Not deployed
+    } finally {
+      setLoading(false);
     }
-    load();
   }, []);
 
-  return { stats, loading };
+  useEffect(() => {
+    fetchStats();
+    if (refreshMs > 0) {
+      const id = setInterval(fetchStats, refreshMs);
+      return () => clearInterval(id);
+    }
+  }, [fetchStats, refreshMs]);
+
+  return { stats, loading, refetch: fetchStats };
 }
 
 // ── Vault list hook ──────────────────────────────────────────────────────────
@@ -191,78 +196,125 @@ export interface VaultInfo {
   totalRedeemed: bigint;
 }
 
-export function useVaultList() {
+export function useVaultList(refreshMs = 0) {
   const [vaults, setVaults] = useState<VaultInfo[]>([]);
   const [loading, setLoading] = useState(true);
 
-  useEffect(() => {
-    async function load() {
-      try {
-        const provider = getProvider();
-        if (!starknetConfig.registryAddress) {
-          setLoading(false);
-          return;
-        }
-        const registry = new Contract({ abi: REGISTRY_ABI, address: starknetConfig.registryAddress, providerOrAccount: provider });
-        const count = Number(await registry.call("get_vault_count", []));
-        const list: VaultInfo[] = [];
-
-        for (let i = 1; i <= count; i++) {
-          try {
-            // eslint-disable-next-line @typescript-eslint/no-explicit-any
-            const info: any = await registry.call("get_vault_info", [i]);
-            list.push({
-              id: i,
-              owner: String(info[0] ?? ""),
-              collateral: BigInt(String(info[1] ?? 0)),
-              status: Number(info[2] ?? 0),
-              zcashAddress: String(info[3] ?? ""),
-              collateralRatio: Number(info[4] ?? 0),
-              totalIssued: BigInt(String(info[5] ?? 0)),
-              totalRedeemed: BigInt(String(info[6] ?? 0)),
-            });
-          } catch {
-            // Skip errored vaults
-          }
-        }
-        setVaults(list);
-      } catch {
-        // Not deployed
-      } finally {
+  const fetchVaults = useCallback(async () => {
+    try {
+      const provider = getProvider();
+      if (!starknetConfig.registryAddress) {
         setLoading(false);
+        return;
       }
+      const registry = new Contract({ abi: REGISTRY_ABI, address: starknetConfig.registryAddress, providerOrAccount: provider });
+      const count = Number(await registry.call("get_vault_count", []));
+      const list: VaultInfo[] = [];
+
+      // Vault IDs are 0-indexed on-chain (0 .. count-1)
+      for (let i = 0; i < count; i++) {
+        try {
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          const info: any = await registry.call("get_vault", [i]);
+          list.push({
+            id: i + 1, // Display as 1-based (on-chain vault_id is 0-based)
+            owner: String(info[0] ?? ""),
+            collateral: BigInt(String(info[3] ?? 0)),
+            status: Number(info[4] ?? 0),
+            zcashAddress: String(info[1] ?? ""),
+            collateralRatio: 0, // Not directly stored; computed from registry params
+            totalIssued: BigInt(String(info[8] ?? 0)),
+            totalRedeemed: BigInt(String(info[9] ?? 0)),
+          });
+        } catch {
+          // Skip errored vaults
+        }
+      }
+      setVaults(list);
+    } catch {
+      // Not deployed
+    } finally {
+      setLoading(false);
     }
-    load();
   }, []);
 
-  return { vaults, loading };
+  useEffect(() => {
+    fetchVaults();
+    if (refreshMs > 0) {
+      const id = setInterval(fetchVaults, refreshMs);
+      return () => clearInterval(id);
+    }
+  }, [fetchVaults, refreshMs]);
+
+  return { vaults, loading, refetch: fetchVaults };
 }
 
 // ── wZEC balance hook ────────────────────────────────────────────────────────
 
-export function useWzecBalance(address: string) {
+export function useWzecBalance(address: string, refreshMs = 0) {
   const [balance, setBalance] = useState<bigint>(0n);
   const [loading, setLoading] = useState(true);
 
-  useEffect(() => {
-    async function load() {
-      if (!address || !starknetConfig.wzecAddress) {
-        setLoading(false);
-        return;
-      }
-      try {
-        const provider = getProvider();
-        const wzec = new Contract({ abi: WZEC_ABI, address: starknetConfig.wzecAddress, providerOrAccount: provider });
-        const bal = await wzec.call("balance_of", [address]);
-        setBalance(BigInt(String(bal ?? 0)));
-      } catch {
-        // Not deployed
-      } finally {
-        setLoading(false);
-      }
+  const fetchBalance = useCallback(async () => {
+    if (!address || !starknetConfig.wzecAddress) {
+      setLoading(false);
+      return;
     }
-    load();
+    try {
+      const provider = getProvider();
+      const wzec = new Contract({ abi: WZEC_ABI, address: starknetConfig.wzecAddress, providerOrAccount: provider });
+      const bal = await wzec.call("balance_of", [address]);
+      setBalance(BigInt(String(bal ?? 0)));
+    } catch {
+      // Not deployed
+    } finally {
+      setLoading(false);
+    }
   }, [address]);
 
-  return { balance, loading };
+  useEffect(() => {
+    fetchBalance();
+    if (refreshMs > 0) {
+      const id = setInterval(fetchBalance, refreshMs);
+      return () => clearInterval(id);
+    }
+  }, [fetchBalance, refreshMs]);
+
+  return { balance, loading, refetch: fetchBalance };
+}
+
+// ── Zcash balance hook (via API route) ───────────────────────────────────────
+
+export function useZcashBalance(zcashAddress: string, refreshMs = 0) {
+  const [balance, setBalance] = useState<string>("—");
+  const [loading, setLoading] = useState(true);
+
+  const fetchBalance = useCallback(async () => {
+    if (!zcashAddress) {
+      setBalance("—");
+      setLoading(false);
+      return;
+    }
+    try {
+      const res = await fetch(`/api/zcash-balance?address=${encodeURIComponent(zcashAddress)}`);
+      if (res.ok) {
+        const data = await res.json();
+        setBalance(data.balance ?? "—");
+      }
+    } catch {
+      // API not available
+    } finally {
+      setLoading(false);
+    }
+  }, [zcashAddress]);
+
+  useEffect(() => {
+    fetchBalance();
+    if (refreshMs > 0) {
+      const id = setInterval(fetchBalance, refreshMs);
+      return () => clearInterval(id);
+    }
+  }, [fetchBalance, refreshMs]);
+
+  return { balance, loading, refetch: fetchBalance };
 }

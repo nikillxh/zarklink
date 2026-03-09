@@ -3,6 +3,7 @@ import localFont from "next/font/local";
 import Navbar from "@/components/Navbar";
 import Footer from "@/components/Footer";
 import { AccountProvider } from "@/context/AccountContext";
+import { WalletProvider } from "@/context/WalletContext";
 import "./globals.css";
 
 const geistSans = localFont({
@@ -32,9 +33,11 @@ export default function RootLayout({
         className={`${geistSans.variable} ${geistMono.variable} antialiased min-h-screen flex flex-col`}
       >
         <AccountProvider>
-          <Navbar />
-          <main className="flex-1">{children}</main>
-          <Footer />
+          <WalletProvider>
+            <Navbar />
+            <main className="flex-1">{children}</main>
+            <Footer />
+          </WalletProvider>
         </AccountProvider>
       </body>
     </html>

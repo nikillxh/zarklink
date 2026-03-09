@@ -10,11 +10,13 @@
   },
   "dependencies": {
     "@tailwindcss/postcss": "^4.2.1",
+    "get-starknet-core": "^3.3.5",
     "lucide-react": "^0.577.0",
     "next": "16.1.6",
     "react": "^19.2.4",
     "react-dom": "^19.2.4",
-    "starknet": "^9.2.1"
+    "starknet": "^9.2.1",
+    "starknetkit": "^3.4.3"
   },
   "devDependencies": {
     "@types/node": "^22",

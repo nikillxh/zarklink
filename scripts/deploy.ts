@@ -10,9 +10,13 @@
 //         npx tsx scripts/deploy.ts --skip-config  # skip post-deploy invokes
 // ============================================================================
 
-import { RpcProvider, Account, json, CallData, shortString, hash } from "starknet";
+import { RpcProvider, Account, json, CallData, shortString, hash, logger } from "starknet";
 import * as fs from "fs";
 import * as path from "path";
+
+// Suppress starknet.js fee-estimation warnings on devnet
+// ("Insufficient transaction data" — benign, devnet has too few txs for tip estimation)
+logger.setLogLevel('ERROR');
 import { execSync } from "child_process";
 
 // ── Config ───────────────────────────────────────────────────────────────────
@@ -293,10 +297,12 @@ async function main() {
 
   if (fs.existsSync(ENV_FILE)) {
     let env = fs.readFileSync(ENV_FILE, "utf-8");
-    // Remove old contract address lines
+    // Remove old contract address lines (both _ADDRESS and _CONTRACT suffixes)
     const stripKeys = [
       "WZEC_TOKEN_ADDRESS", "ORACLE_ADDRESS", "VAULT_REGISTRY_ADDRESS",
       "ZCASH_RELAY_ADDRESS", "BRIDGE_PROTOCOL_ADDRESS", "VAULT_POOL_ADDRESS",
+      "WZEC_TOKEN_CONTRACT", "ORACLE_CONTRACT", "VAULT_REGISTRY_CONTRACT",
+      "ZCASH_RELAY_CONTRACT", "BRIDGE_PROTOCOL_CONTRACT", "VAULT_POOL_CONTRACT",
     ];
     for (const key of stripKeys) {
       env = env.replace(new RegExp(`^${key}=.*$\\n?`, "gm"), "");
@@ -312,6 +318,14 @@ VAULT_REGISTRY_ADDRESS=${registry.address}
 ZCASH_RELAY_ADDRESS=${relay.address}
 BRIDGE_PROTOCOL_ADDRESS=${bridge.address}
 VAULT_POOL_ADDRESS=${pool.address}
+
+# ── Service-compatible aliases (used by relayer & vault-daemon) ──
+WZEC_TOKEN_CONTRACT=${wzec.address}
+ORACLE_CONTRACT=${oracle.address}
+VAULT_REGISTRY_CONTRACT=${registry.address}
+ZCASH_RELAY_CONTRACT=${relay.address}
+BRIDGE_PROTOCOL_CONTRACT=${bridge.address}
+VAULT_POOL_CONTRACT=${pool.address}
 `;
     fs.writeFileSync(ENV_FILE, env);
     ok(`.env.devnet updated with contract addresses`);

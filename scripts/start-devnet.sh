@@ -10,11 +10,13 @@
 #   ./scripts/start-devnet.sh                       # Start both chains
 #   ./scripts/start-devnet.sh --deploy              # Start + deploy contracts
 #   ./scripts/start-devnet.sh --frontend            # Start + launch Next.js dev
-#   ./scripts/start-devnet.sh --deploy --frontend   # Full stack
+#   ./scripts/start-devnet.sh --deploy --frontend   # Deploy + frontend
+#   ./scripts/start-devnet.sh --services            # Register vault + start relayer/vault-daemon
+#   ./scripts/start-devnet.sh --full-stack          # Everything (deploy + services + frontend)
 #   ./scripts/start-devnet.sh stop                  # Stop all services
 #   ./scripts/start-devnet.sh status                # Check service status
 #   ./scripts/start-devnet.sh reset                 # Wipe state and restart
-#   ./scripts/start-devnet.sh reset --deploy --frontend
+#   ./scripts/start-devnet.sh reset --full-stack
 # ============================================================================
 
 set -euo pipefail
@@ -36,12 +38,24 @@ ZCASH_RPC_PASS="zarklink-dev-$(date +%s | sha256sum | head -c 16)"
 ZCASH_MINERS=3
 ZCASH_INITIAL_BLOCKS=110
 
+# ── Number of vault operators to register ─────────────────────────────────
+# Change this default to control how many vaults are created in devnet.
+# Override at runtime with: --vaults N
+NUM_VAULTS=8
+
 # Starknet devnet configuration
 STARKNET_HOST="127.0.0.1"
 STARKNET_PORT=5050
 STARKNET_SEED=42
-STARKNET_ACCOUNTS=10
+# Accounts: 1 deployer + NUM_VAULTS vaults + issuer + redeemer + relayer + oracle + 1 spare
+STARKNET_ACCOUNTS=$((NUM_VAULTS + 7))
 STARKNET_INITIAL_BALANCE="1000000000000000000000"
+
+# Derived role indices (auto-computed from NUM_VAULTS)
+ISSUER_INDEX=$((NUM_VAULTS + 1))
+REDEEMER_INDEX=$((NUM_VAULTS + 2))
+RELAYER_INDEX=$((NUM_VAULTS + 3))
+ORACLE_INDEX=$((NUM_VAULTS + 4))
 
 # Frontend
 FRONTEND_DIR="${PROJECT_ROOT}/frontend"
@@ -97,6 +111,40 @@ wait_for_port() {
 save_pid() {
   local name=$1 pid=$2
   echo "$pid" > "${PID_DIR}/${name}.pid"
+}
+
+# Detect npm vs pnpm
+detect_pkg_manager() {
+  if [ -f "${PROJECT_ROOT}/pnpm-lock.yaml" ] && command -v pnpm &>/dev/null; then
+    echo "pnpm"
+  else
+    echo "npm"
+  fi
+}
+
+# Run a package.json script in a directory using the detected package manager
+pkg_run() {
+  local dir="$1"
+  shift
+  local pm
+  pm=$(detect_pkg_manager)
+  if [ "$pm" = "pnpm" ]; then
+    (cd "$dir" && pnpm "$@")
+  else
+    (cd "$dir" && npm "$@")
+  fi
+}
+
+# Install deps in a package directory
+pkg_install() {
+  local dir="$1"
+  local pm
+  pm=$(detect_pkg_manager)
+  if [ "$pm" = "pnpm" ]; then
+    (cd "${PROJECT_ROOT}" && pnpm install)
+  else
+    (cd "$dir" && npm install --silent)
+  fi
 }
 
 get_pid() {
@@ -230,7 +278,7 @@ zcash_rpc() {
 }
 
 fund_zcash_accounts() {
-  log_header "Funding Zcash Regtest Accounts"
+  log_header "Funding Zcash Regtest Accounts (${NUM_VAULTS} vaults)"
 
   local block_count
   block_count=$(zcash_rpc getblockcount 2>/dev/null || echo "0")
@@ -243,8 +291,8 @@ fund_zcash_accounts() {
     log_info "Chain already has ${block_count} blocks, skipping mining"
   fi
 
-  # Create transparent addresses for test accounts
-  log_info "Creating transparent test addresses..."
+  # Create transparent addresses for funding
+  log_info "Creating ${ZCASH_MINERS} transparent funding addresses..."
   local t_addrs=()
   for i in $(seq 1 "$ZCASH_MINERS"); do
     local addr
@@ -253,67 +301,95 @@ fund_zcash_accounts() {
     log_info "  T-addr ${i}: ${addr}"
   done
 
-  # Create shielded (Sapling) addresses for vault + issuer + redeemer
-  log_info "Creating shielded Sapling addresses..."
-  local z_addrs=()
-  local z_labels=("vault-operator" "issuer-alice" "redeemer-dave")
-  for i in $(seq 0 2); do
+  # Create shielded (Sapling) addresses for each vault operator
+  log_info "Creating ${NUM_VAULTS} vault shielded addresses..."
+  local vault_z_addrs=()
+  for i in $(seq 1 "$NUM_VAULTS"); do
     local addr
     addr=$(zcash_rpc z_getnewaddress sapling)
-    z_addrs+=("$addr")
-    log_info "  Z-addr (${z_labels[$i]}): ${addr:0:20}...${addr: -8}"
+    vault_z_addrs+=("$addr")
+    log_info "  Vault #${i}: ${addr:0:20}...${addr: -8}"
   done
 
-  # Fund transparent addresses
+  # Create shielded addresses for issuer and redeemer
+  log_info "Creating issuer and redeemer shielded addresses..."
+  local issuer_z_addr
+  issuer_z_addr=$(zcash_rpc z_getnewaddress sapling)
+  log_info "  Issuer:   ${issuer_z_addr:0:20}...${issuer_z_addr: -8}"
+
+  local redeemer_z_addr
+  redeemer_z_addr=$(zcash_rpc z_getnewaddress sapling)
+  log_info "  Redeemer: ${redeemer_z_addr:0:20}...${redeemer_z_addr: -8}"
+
+  # Fund transparent addresses (for shielding later)
   log_info "Funding transparent addresses..."
   for addr in "${t_addrs[@]}"; do
-    zcash_rpc sendtoaddress "$addr" 100.0 >/dev/null 2>&1 || true
+    zcash_rpc sendtoaddress "$addr" 250.0 >/dev/null 2>&1 || true
   done
   zcash_rpc generate 10 >/dev/null
 
-  # Shield funds to Sapling addresses
+  # Shield funds to Sapling addresses in batches
   log_info "Shielding funds to Sapling addresses..."
-  for z_addr in "${z_addrs[@]}"; do
-    local opid
-    opid=$(zcash_rpc z_sendmany "${t_addrs[0]}" \
-      "[{\"address\": \"${z_addr}\", \"amount\": 50.0}]" 1 0.0001 2>/dev/null || true)
-    if [ -n "$opid" ]; then
-      log_info "  Shield operation: ${opid}"
+  local batch_json="" batch_count=0 funder_idx=0
+  local per_vault="5.0"
+
+  for i in $(seq 0 $((NUM_VAULTS - 1))); do
+    [ -z "$batch_json" ] && batch_json="[" || batch_json+=","
+    batch_json+="{\"address\":\"${vault_z_addrs[$i]}\",\"amount\":${per_vault}}"
+    batch_count=$((batch_count + 1))
+    # Send batch every 5 recipients
+    if [ "$batch_count" -ge 5 ] || [ "$i" -eq $((NUM_VAULTS - 1)) ]; then
+      batch_json+="]"
+      local opid
+      opid=$(zcash_rpc z_sendmany "${t_addrs[$funder_idx]}" "$batch_json" 1 0.0001 2>/dev/null || true)
+      [ -n "$opid" ] && log_info "  Vault batch (${batch_count} addrs): ${opid}"
+      batch_json="" ; batch_count=0
+      funder_idx=$(( (funder_idx + 1) % ${#t_addrs[@]} ))
     fi
   done
 
+  # Fund issuer and redeemer
+  local user_batch="[{\"address\":\"${issuer_z_addr}\",\"amount\":25.0},{\"address\":\"${redeemer_z_addr}\",\"amount\":25.0}]"
+  local opid_users
+  opid_users=$(zcash_rpc z_sendmany "${t_addrs[$funder_idx]}" "$user_batch" 1 0.0001 2>/dev/null || true)
+  [ -n "$opid_users" ] && log_info "  User batch: ${opid_users}"
+
   # Mine blocks to confirm shielded transfers
-  sleep 2
+  sleep 3
   zcash_rpc generate 20 >/dev/null
 
   # Get balances
   local total_balance
   total_balance=$(zcash_rpc z_gettotalbalance 2>/dev/null || echo "{}")
 
-  log_success "Zcash accounts funded"
+  log_success "Zcash accounts funded (${NUM_VAULTS} vaults + issuer + redeemer)"
   log_info "Total balance: ${total_balance}"
 
-  # Export to JSON
-  cat > "${DATA_DIR}/zcash-accounts.json" <<EOF
-{
-  "rpc_url": "http://127.0.0.1:${ZCASH_RPC_PORT}",
-  "rpc_user": "${ZCASH_RPC_USER}",
-  "rpc_password": "${ZCASH_RPC_PASS}",
-  "transparent_addresses": [
-$(printf '    "%s",\n' "${t_addrs[@]}" | sed '$ s/,$//')
-  ],
-  "shielded_addresses": {
-    "vault_operator": "${z_addrs[0]}",
-    "issuer_alice": "${z_addrs[1]}",
-    "redeemer_dave": "${z_addrs[2]}"
-  },
-  "labels": {
-    "vault_operator": "Vault operator — custodial Sapling address",
-    "issuer_alice": "Issuer — locks ZEC to mint wZEC",
-    "redeemer_dave": "Redeemer — burns wZEC to unlock ZEC"
-  }
+  # Export to JSON using Python for clean generation
+  python3 - "${DATA_DIR}" "${NUM_VAULTS}" "${ZCASH_RPC_PORT}" "${ZCASH_RPC_USER}" "${ZCASH_RPC_PASS}" \
+    "${issuer_z_addr}" "${redeemer_z_addr}" "${t_addrs[@]}" "--" "${vault_z_addrs[@]}" <<'ZACCTS_PY'
+import sys, json
+data_dir = sys.argv[1]
+nv = int(sys.argv[2])
+rpc_port, rpc_user, rpc_pass = sys.argv[3], sys.argv[4], sys.argv[5]
+issuer_addr, redeemer_addr = sys.argv[6], sys.argv[7]
+sep = sys.argv.index("--")
+t_addrs = sys.argv[8:sep]
+vault_addrs = sys.argv[sep+1:]
+data = {
+    "rpc_url": f"http://127.0.0.1:{rpc_port}",
+    "rpc_user": rpc_user,
+    "rpc_password": rpc_pass,
+    "num_vaults": nv,
+    "transparent_addresses": t_addrs,
+    "vault_shielded_addresses": vault_addrs,
+    "issuer_shielded_address": issuer_addr,
+    "redeemer_shielded_address": redeemer_addr,
 }
-EOF
+with open(f"{data_dir}/zcash-accounts.json", "w") as f:
+    json.dump(data, f, indent=2)
+print(f"  Saved {nv} vault + 2 user Zcash addresses")
+ZACCTS_PY
 
   log_success "Zcash accounts saved to ${DATA_DIR}/zcash-accounts.json"
 }
@@ -379,7 +455,7 @@ fetch_starknet_accounts() {
 
   # Parse and display accounts
   local count
-  count=$(echo "$response" | python3 -c "import sys,json; print(len(json.load(sys.stdin)))" 2>/dev/null || echo "?")
+  count=$(echo "$response" | python3 -c "import sys,json; print(len(json.load(sys.stdin).get('result', [])))" 2>/dev/null || echo "?")
 
   log_success "${count} predeployed accounts available"
 
@@ -390,18 +466,14 @@ import json
 with open("${DATA_DIR}/starknet-accounts.json") as f:
   accounts = json.load(f)
 
-roles = [
-  "Deployer / Admin",
-  "Vault Operator #1",
-  "Vault Operator #2",
-  "Issuer (Alice)",
-  "Redeemer (Dave)",
-  "Relayer Service",
-  "Oracle Service",
-  "Test User #1",
-  "Test User #2",
-  "Test User #3",
-]
+NV = ${NUM_VAULTS}
+roles = ["Deployer / Admin"]
+for vi in range(1, NV + 1):
+  roles.append(f"Vault Operator #{vi}")
+roles.extend(["Issuer (Alice)", "Redeemer (Dave)", "Relayer Service", "Oracle Service"])
+base = len(roles)
+for ti in range(base, len(accounts)):
+  roles.append(f"Test User #{ti - base + 1}")
 
 role_map = {}
 for i, acc in enumerate(accounts):
@@ -455,9 +527,12 @@ stop_starknet() {
 start_frontend() {
   log_header "Starting Next.js Frontend"
 
+  # If already running, restart it so the latest .env.local is picked up
+  # (Next.js only reads env files at server startup, NOT hot-reloaded)
   if is_running "next-dev"; then
-    log_warn "Next.js is already running (PID: $(get_pid next-dev))"
-    return 0
+    log_info "Restarting Next.js to pick up fresh .env.local..."
+    stop_frontend
+    sleep 1
   fi
 
   if [ ! -d "${FRONTEND_DIR}" ]; then
@@ -468,15 +543,22 @@ start_frontend() {
   # Install deps if node_modules missing
   if [ ! -d "${FRONTEND_DIR}/node_modules" ]; then
     log_info "Installing frontend dependencies..."
-    (cd "${FRONTEND_DIR}" && npm install --silent) || {
-      log_error "npm install failed"
+    pkg_install "${FRONTEND_DIR}" || {
+      log_error "Package install failed"
       return 1
     }
   fi
 
   # Start Next.js dev server
-  (cd "${FRONTEND_DIR}" && npm run dev -- --port "${FRONTEND_PORT}") \
-    > "${LOG_DIR}/frontend.log" 2>&1 &
+  local pm
+  pm=$(detect_pkg_manager)
+  if [ "$pm" = "pnpm" ]; then
+    (cd "${FRONTEND_DIR}" && pnpm dev --port "${FRONTEND_PORT}") \
+      > "${LOG_DIR}/frontend.log" 2>&1 &
+  else
+    (cd "${FRONTEND_DIR}" && npm run dev -- --port "${FRONTEND_PORT}") \
+      > "${LOG_DIR}/frontend.log" 2>&1 &
+  fi
 
   local pid=$!
   save_pid "next-dev" "$pid"
@@ -549,17 +631,17 @@ EOF
 DEPLOYER_ADDRESS=${deployer_addr}
 DEPLOYER_PRIVATE_KEY=${deployer_pk}
 
-# Vault Operator Account (auto-assigned from predeployed accounts[1])
+# Vault Operator Account (primary vault — accounts[1])
 VAULT_ADDRESS=$(python3 -c "import json; d=json.load(open('${DATA_DIR}/starknet-accounts.json')); print(d[1]['address'])" 2>/dev/null || echo "")
 VAULT_PRIVATE_KEY=$(python3 -c "import json; d=json.load(open('${DATA_DIR}/starknet-accounts.json')); print(d[1]['private_key'])" 2>/dev/null || echo "")
 
-# Issuer Account (auto-assigned from predeployed accounts[3])
-ISSUER_ADDRESS=$(python3 -c "import json; d=json.load(open('${DATA_DIR}/starknet-accounts.json')); print(d[3]['address'])" 2>/dev/null || echo "")
-ISSUER_PRIVATE_KEY=$(python3 -c "import json; d=json.load(open('${DATA_DIR}/starknet-accounts.json')); print(d[3]['private_key'])" 2>/dev/null || echo "")
+# Issuer Account (accounts[NUM_VAULTS+1])
+ISSUER_ADDRESS=$(python3 -c "import json; d=json.load(open('${DATA_DIR}/starknet-accounts.json')); print(d[${ISSUER_INDEX}]['address'])" 2>/dev/null || echo "")
+ISSUER_PRIVATE_KEY=$(python3 -c "import json; d=json.load(open('${DATA_DIR}/starknet-accounts.json')); print(d[${ISSUER_INDEX}]['private_key'])" 2>/dev/null || echo "")
 
-# Redeemer Account (auto-assigned from predeployed accounts[4])
-REDEEMER_ADDRESS=$(python3 -c "import json; d=json.load(open('${DATA_DIR}/starknet-accounts.json')); print(d[4]['address'])" 2>/dev/null || echo "")
-REDEEMER_PRIVATE_KEY=$(python3 -c "import json; d=json.load(open('${DATA_DIR}/starknet-accounts.json')); print(d[4]['private_key'])" 2>/dev/null || echo "")
+# Redeemer Account (accounts[NUM_VAULTS+2])
+REDEEMER_ADDRESS=$(python3 -c "import json; d=json.load(open('${DATA_DIR}/starknet-accounts.json')); print(d[${REDEEMER_INDEX}]['address'])" 2>/dev/null || echo "")
+REDEEMER_PRIVATE_KEY=$(python3 -c "import json; d=json.load(open('${DATA_DIR}/starknet-accounts.json')); print(d[${REDEEMER_INDEX}]['private_key'])" 2>/dev/null || echo "")
 EOF
     fi
   fi
@@ -670,6 +752,10 @@ NEXT_PUBLIC_POOL_ADDRESS=${pool_addr}
 NEXT_PUBLIC_RELAY_ADDRESS=${relay_addr}
 NEXT_PUBLIC_WZEC_ADDRESS=${wzec_addr}
 NEXT_PUBLIC_ORACLE_ADDRESS=${oracle_addr}
+
+# ── Zcash RPC Credentials (server-only, for API routes) ─────────────────
+ZCASH_RPC_USER=${ZCASH_RPC_USER}
+ZCASH_RPC_PASS=${ZCASH_RPC_PASS}
 EOF
 
   log_success "Frontend env written to ${frontend_env}"
@@ -679,23 +765,368 @@ EOF
     local accounts_json
     accounts_json=$(python3 -c "
 import json
+NV = ${NUM_VAULTS}
 with open('${DATA_DIR}/starknet-accounts.json') as f:
     accs = json.load(f)
-roles = ['Deployer','Vault Operator','Relayer','Issuer','Redeemer','User A','User B','User C','User D','User E']
+try:
+    with open('${DATA_DIR}/zcash-accounts.json') as f:
+        zdata = json.load(f)
+except Exception:
+    zdata = {}
+vault_z = zdata.get('vault_shielded_addresses', [])
+issuer_z = zdata.get('issuer_shielded_address', '')
+redeemer_z = zdata.get('redeemer_shielded_address', '')
+roles = ['Deployer']
+for vi in range(1, NV + 1):
+    roles.append(f'Vault #{vi}')
+roles.extend(['Issuer (Alice)', 'Redeemer (Dave)', 'Relayer', 'Oracle'])
 result = []
 for i, a in enumerate(accs):
-    result.append({'address': a['address'], 'private_key': a['private_key'], 'label': roles[i] if i < len(roles) else f'Account {i}'})
+    entry = {'address': a['address'], 'private_key': a['private_key'], 'label': roles[i] if i < len(roles) else f'User {i - len(roles) + 1}'}
+    if 1 <= i <= NV and (i - 1) < len(vault_z):
+        entry['zcash_shielded'] = vault_z[i - 1]
+    elif i == NV + 1 and issuer_z:
+        entry['zcash_shielded'] = issuer_z
+    elif i == NV + 2 and redeemer_z:
+        entry['zcash_shielded'] = redeemer_z
+    result.append(entry)
 print(json.dumps(result))
 " 2>/dev/null || echo '[]')
     echo "" >> "${frontend_env}"
     echo "# ── Devnet Accounts (for account switcher) ────────────────────────" >> "${frontend_env}"
-    echo "NEXT_PUBLIC_DEVNET_ACCOUNTS=${accounts_json}" >> "${frontend_env}"
+    echo "NEXT_PUBLIC_DEVNET_ACCOUNTS='${accounts_json}'" >> "${frontend_env}"
+
+    # Also write to a static JSON file that the frontend can import reliably
+    # (avoids dotenv parsing issues with large JSON values)
+    local public_dir="${PROJECT_ROOT}/frontend/public"
+    mkdir -p "${public_dir}"
+    echo "${accounts_json}" > "${public_dir}/devnet-accounts.json"
+    log_info "Devnet accounts also written to frontend/public/devnet-accounts.json"
   fi
 
   if [ -z "${bridge_addr}" ]; then
     log_warn "Contract addresses empty — run './scripts/deploy.sh' then re-run with 'start'"
     log_warn "  or use: ./scripts/start-devnet.sh start --deploy"
   fi
+}
+
+# ---------------------------------------------------------------------------
+# Vault Registration (register vault + deposit collateral on Starknet)
+# ---------------------------------------------------------------------------
+setup_vault() {
+  log_header "Setting Up ${NUM_VAULTS} Vault Operators"
+
+  if [ ! -f "${DATA_DIR}/deployments.json" ]; then
+    log_warn "No deployments found — skipping vault setup (deploy contracts first)"
+    return 0
+  fi
+
+  local pm
+  pm=$(detect_pkg_manager)
+
+  # Resolve tsx
+  local tsx_bin=""
+  if [ -x "${PROJECT_ROOT}/relayer/node_modules/.bin/tsx" ]; then
+    tsx_bin="${PROJECT_ROOT}/relayer/node_modules/.bin/tsx"
+  elif [ "$pm" = "pnpm" ]; then
+    tsx_bin="pnpm exec tsx"
+  else
+    tsx_bin="npx tsx"
+  fi
+
+  export NODE_PATH="${PROJECT_ROOT}/relayer/node_modules"
+
+  # Load env
+  if [ -f "${PROJECT_ROOT}/.env.devnet" ]; then
+    set -a
+    source "${PROJECT_ROOT}/.env.devnet"
+    set +a
+  fi
+
+  # Run vault setup script inline via tsx — registers NUM_VAULTS vaults
+  ${tsx_bin} --eval "
+import { RpcProvider, Account, CallData, logger } from 'starknet';
+import * as fs from 'fs';
+
+// Suppress harmless fee-estimation warnings on devnet (too few txs for tip analysis)
+logger.setLogLevel('ERROR');
+
+const DATA_DIR = '${DATA_DIR}';
+const NUM_VAULTS = ${NUM_VAULTS};
+const deployments = JSON.parse(fs.readFileSync(DATA_DIR + '/deployments.json', 'utf-8'));
+const accounts = JSON.parse(fs.readFileSync(DATA_DIR + '/starknet-accounts.json', 'utf-8'));
+
+const provider = new RpcProvider({ nodeUrl: '${STARKNET_RPC_URL:-http://127.0.0.1:5050}' });
+
+// Deployer (owner) = accounts[0]
+const deployer = accounts[0];
+const deployerAccount = new Account({ provider, address: deployer.address, signer: deployer.private_key });
+
+const registryAddr = deployments.contracts.vault_registry.address;
+const poolAddr = deployments.contracts.vault_pool.address;
+const wzecAddr = deployments.contracts.wzec_token.address;
+const bridgeAddr = deployments.contracts.bridge_protocol.address;
+const collateralPerVault = '1000000000'; // 10 ZEC in zatoshi per vault
+
+async function setupOneVault(index: number) {
+  const vaultOp = accounts[index];
+  if (!vaultOp) { console.error('[Vault ' + index + '] Account not found — increase STARKNET_ACCOUNTS'); return; }
+  const vaultAccount = new Account({ provider, address: vaultOp.address, signer: vaultOp.private_key });
+  const tag = '[Vault ' + index + ']';
+  console.log(tag + ' Setting up: ' + vaultOp.address.slice(0, 16) + '...');
+
+  // 1. Register vault
+  try {
+    const regTx = await vaultAccount.execute({
+      contractAddress: registryAddr,
+      entrypoint: 'register_vault',
+      calldata: CallData.compile({
+        zcash_addr_d: '0x' + (BigInt('0x1234567890abcdef') + BigInt(index)).toString(16),
+        zcash_addr_pkd: '0x' + (BigInt('0xfedcba0987654321') + BigInt(index)).toString(16),
+      }),
+    });
+    await vaultAccount.waitForTransaction(regTx.transaction_hash);
+    console.log(tag + ' Registered');
+  } catch (e: any) {
+    const msg = e?.message || String(e);
+    if (msg.includes('already registered') || msg.includes('VAULT_ALREADY_EXISTS')) {
+      console.log(tag + ' Already registered (skipping)');
+    } else {
+      console.error(tag + ' register_vault failed: ' + msg.slice(0, 200));
+      return;
+    }
+  }
+
+  // 2. Deployer mints wZEC to vault operator for collateral
+  // (bridge authority is temporarily set to deployer in main())
+  try {
+    const mintTx = await deployerAccount.execute({
+      contractAddress: wzecAddr,
+      entrypoint: 'mint',
+      calldata: CallData.compile({ to: vaultOp.address, amount: { low: collateralPerVault, high: '0' } }),
+    });
+    await deployerAccount.waitForTransaction(mintTx.transaction_hash);
+    console.log(tag + ' Minted ' + collateralPerVault + ' wZEC');
+  } catch (e: any) {
+    console.error(tag + ' Mint FAILED: ' + (e?.message || String(e)).slice(0, 200));
+  }
+
+  // 3. Approve VaultPool to spend wZEC
+  try {
+    const appTx = await vaultAccount.execute({
+      contractAddress: wzecAddr,
+      entrypoint: 'approve',
+      calldata: CallData.compile({ spender: poolAddr, amount: { low: collateralPerVault, high: '0' } }),
+    });
+    await vaultAccount.waitForTransaction(appTx.transaction_hash);
+    console.log(tag + ' Approved VaultPool');
+  } catch (e: any) {
+    console.error(tag + ' Approve FAILED: ' + (e?.message || String(e)).slice(0, 100));
+  }
+
+  // 4. Deposit collateral into VaultRegistry (updates on-chain vault collateral)
+  try {
+    const regDepTx = await vaultAccount.execute({
+      contractAddress: registryAddr,
+      entrypoint: 'deposit_collateral',
+      calldata: CallData.compile({ amount: { low: collateralPerVault, high: '0' } }),
+    });
+    await vaultAccount.waitForTransaction(regDepTx.transaction_hash);
+    console.log(tag + ' Deposited to VaultRegistry');
+  } catch (e: any) {
+    console.error(tag + ' Registry deposit FAILED: ' + (e?.message || String(e)).slice(0, 100));
+  }
+
+  // 5. Deposit collateral into VaultPool (updates pool accounting)
+  try {
+    const depTx = await vaultAccount.execute({
+      contractAddress: poolAddr,
+      entrypoint: 'deposit_collateral',
+      calldata: CallData.compile({ amount: { low: collateralPerVault, high: '0' } }),
+    });
+    await vaultAccount.waitForTransaction(depTx.transaction_hash);
+    console.log(tag + ' Deposited to VaultPool');
+  } catch (e: any) {
+    console.error(tag + ' Pool deposit FAILED: ' + (e?.message || String(e)).slice(0, 100));
+  }
+
+  console.log(tag + ' Ready!');
+}
+
+async function main() {
+  // Temporarily grant deployer mint authority so we can mint wZEC for collateral.
+  // WzecToken.mint() asserts caller == bridge, so we set_bridge to deployer,
+  // mint all tokens, then restore bridge to BridgeProtocol.
+  console.log('[Setup] Granting deployer temporary mint authority...');
+  try {
+    const setBridgeTx = await deployerAccount.execute({
+      contractAddress: wzecAddr,
+      entrypoint: 'set_bridge',
+      calldata: CallData.compile({ bridge: deployer.address }),
+    });
+    await deployerAccount.waitForTransaction(setBridgeTx.transaction_hash);
+    console.log('[Setup] Deployer is now temporary bridge (can mint)');
+  } catch (e: any) {
+    console.error('[Setup] WARN: Could not set_bridge to deployer: ' + (e?.message || '').slice(0, 150));
+  }
+
+  console.log('[Setup] Registering ' + NUM_VAULTS + ' vault operators (accounts[1..' + NUM_VAULTS + '])...');
+  for (let i = 1; i <= NUM_VAULTS; i++) {
+    await setupOneVault(i);
+  }
+
+  // Restore bridge authority to BridgeProtocol
+  console.log('[Setup] Restoring bridge authority to BridgeProtocol...');
+  try {
+    const restoreTx = await deployerAccount.execute({
+      contractAddress: wzecAddr,
+      entrypoint: 'set_bridge',
+      calldata: CallData.compile({ bridge: bridgeAddr }),
+    });
+    await deployerAccount.waitForTransaction(restoreTx.transaction_hash);
+    console.log('[Setup] Bridge authority restored to ' + bridgeAddr.slice(0, 16) + '...');
+  } catch (e: any) {
+    console.error('[Setup] CRITICAL: Failed to restore bridge! ' + (e?.message || '').slice(0, 150));
+  }
+
+  console.log('[Setup] All ' + NUM_VAULTS + ' vaults configured!');
+}
+
+main().catch(e => { console.error('[Setup] Fatal: ' + e.message); process.exit(1); });
+" || {
+    log_warn "Vault setup had errors (see output above)"
+  }
+
+  log_success "${NUM_VAULTS} vault operators configured"
+}
+
+# ---------------------------------------------------------------------------
+# Relayer Service
+# ---------------------------------------------------------------------------
+start_relayer() {
+  log_header "Starting Zcash Header Relayer"
+
+  if is_running "relayer"; then
+    log_warn "Relayer is already running (PID: $(get_pid relayer))"
+    return 0
+  fi
+
+  if [ ! -d "${PROJECT_ROOT}/relayer/node_modules" ]; then
+    log_info "Installing relayer dependencies..."
+    pkg_install "${PROJECT_ROOT}/relayer"
+  fi
+
+  # Load env
+  if [ -f "${PROJECT_ROOT}/.env.devnet" ]; then
+    set -a
+    source "${PROJECT_ROOT}/.env.devnet"
+    set +a
+  fi
+
+  local pm
+  pm=$(detect_pkg_manager)
+  if [ "$pm" = "pnpm" ]; then
+    (cd "${PROJECT_ROOT}/relayer" && pnpm dev) \
+      > "${LOG_DIR}/relayer.log" 2>&1 &
+  else
+    (cd "${PROJECT_ROOT}/relayer" && npm run dev) \
+      > "${LOG_DIR}/relayer.log" 2>&1 &
+  fi
+
+  local pid=$!
+  save_pid "relayer" "$pid"
+
+  sleep 3
+  if kill -0 "$pid" 2>/dev/null; then
+    log_success "Relayer started (PID: ${pid})"
+  else
+    log_error "Relayer failed to start — check ${LOG_DIR}/relayer.log"
+  fi
+}
+
+stop_relayer() {
+  if is_running "relayer"; then
+    log_info "Stopping relayer..."
+    kill "$(get_pid relayer)" 2>/dev/null || true
+    sleep 1
+    log_success "Relayer stopped"
+  else
+    log_info "Relayer is not running"
+  fi
+  rm -f "${PID_DIR}/relayer.pid"
+}
+
+# ---------------------------------------------------------------------------
+# Vault Daemon
+# ---------------------------------------------------------------------------
+start_vault_daemon() {
+  log_header "Starting Vault Daemon"
+
+  if is_running "vault-daemon"; then
+    log_warn "Vault daemon is already running (PID: $(get_pid vault-daemon))"
+    return 0
+  fi
+
+  if [ ! -d "${PROJECT_ROOT}/vault-daemon/node_modules" ]; then
+    log_info "Installing vault-daemon dependencies..."
+    pkg_install "${PROJECT_ROOT}/vault-daemon"
+  fi
+
+  # Load env
+  if [ -f "${PROJECT_ROOT}/.env.devnet" ]; then
+    set -a
+    source "${PROJECT_ROOT}/.env.devnet"
+    set +a
+  fi
+
+  local pm
+  pm=$(detect_pkg_manager)
+  if [ "$pm" = "pnpm" ]; then
+    (cd "${PROJECT_ROOT}/vault-daemon" && pnpm dev) \
+      > "${LOG_DIR}/vault-daemon.log" 2>&1 &
+  else
+    (cd "${PROJECT_ROOT}/vault-daemon" && npm run dev) \
+      > "${LOG_DIR}/vault-daemon.log" 2>&1 &
+  fi
+
+  local pid=$!
+  save_pid "vault-daemon" "$pid"
+
+  sleep 3
+  if kill -0 "$pid" 2>/dev/null; then
+    log_success "Vault daemon started (PID: ${pid})"
+  else
+    log_error "Vault daemon failed to start — check ${LOG_DIR}/vault-daemon.log"
+  fi
+}
+
+stop_vault_daemon() {
+  if is_running "vault-daemon"; then
+    log_info "Stopping vault daemon..."
+    kill "$(get_pid vault-daemon)" 2>/dev/null || true
+    sleep 1
+    log_success "Vault daemon stopped"
+  else
+    log_info "Vault daemon is not running"
+  fi
+  rm -f "${PID_DIR}/vault-daemon.pid"
+}
+
+# ---------------------------------------------------------------------------
+# Mine Extra Zcash Blocks (for relay finality)
+# ---------------------------------------------------------------------------
+mine_relay_blocks() {
+  log_header "Mining Zcash Blocks for Relay Finality"
+
+  local needed=10
+  log_info "Mining ${needed} extra blocks so relayer has finalized headers..."
+  zcash_rpc generate "${needed}" >/dev/null 2>&1 || {
+    log_warn "Failed to mine blocks (zcashd may not be running)"
+    return 0
+  }
+  local tip
+  tip=$(zcash_rpc getblockcount 2>/dev/null || echo "?")
+  log_success "Zcash chain tip: ${tip}"
 }
 
 # ---------------------------------------------------------------------------
@@ -730,6 +1161,20 @@ show_status() {
     echo -e "  next.js frontend     ${YELLOW}NOT STARTED${NC}      (use --frontend)"
   fi
 
+  # Relayer
+  if is_running "relayer"; then
+    echo -e "  relayer              ${GREEN}RUNNING${NC}         $(get_pid relayer)"
+  else
+    echo -e "  relayer              ${YELLOW}NOT STARTED${NC}      (use --services)"
+  fi
+
+  # Vault daemon
+  if is_running "vault-daemon"; then
+    echo -e "  vault-daemon         ${GREEN}RUNNING${NC}         $(get_pid vault-daemon)"
+  else
+    echo -e "  vault-daemon         ${YELLOW}NOT STARTED${NC}      (use --services)"
+  fi
+
   echo ""
 
   # Show key files
@@ -749,6 +1194,8 @@ show_status() {
 # ---------------------------------------------------------------------------
 stop_all() {
   log_header "Stopping Zarklink Devnet"
+  stop_vault_daemon
+  stop_relayer
   stop_frontend
   stop_zcash
   stop_starknet
@@ -804,6 +1251,18 @@ start_all() {
   # Generate frontend .env.local
   generate_frontend_env
 
+  # Setup vault + start off-chain services if --services flag was passed
+  if [ "${START_SERVICES:-false}" = "true" ]; then
+    if [ -f "${DATA_DIR}/deployments.json" ]; then
+      setup_vault
+      mine_relay_blocks
+      start_relayer
+      start_vault_daemon
+    else
+      log_warn "Contracts not deployed — skipping service startup (use --deploy --services)"
+    fi
+  fi
+
   # Start frontend if --frontend flag was passed
   if [ "${START_FRONTEND:-false}" = "true" ]; then
     start_frontend
@@ -826,7 +1285,13 @@ start_all() {
   echo "    zcash-cli -datadir=${ZCASH_DIR} -rpcport=${ZCASH_RPC_PORT} getblockcount"
   echo "    curl http://${STARKNET_HOST}:${STARKNET_PORT}/is_alive"
   if ! is_running "next-dev"; then
-    echo "    cd frontend && npm run dev    # Start Next.js on http://localhost:3000"
+    local pm_hint
+    pm_hint=$(detect_pkg_manager)
+    if [ "$pm_hint" = "pnpm" ]; then
+      echo "    pnpm -C frontend dev         # Start Next.js on http://localhost:3000"
+    else
+      echo "    cd frontend && npm run dev    # Start Next.js on http://localhost:3000"
+    fi
   fi
   echo ""
   echo -e "  ${CYAN}Stop:${NC}  ./scripts/start-devnet.sh stop"
@@ -883,6 +1348,16 @@ health_check() {
     fi
   fi
 
+  # Check relayer
+  if is_running "relayer"; then
+    log_success "relayer: running"
+  fi
+
+  # Check vault-daemon
+  if is_running "vault-daemon"; then
+    log_success "vault-daemon: running"
+  fi
+
   if $healthy; then
     log_success "All services healthy ✓"
   else
@@ -898,17 +1373,30 @@ health_check() {
 # Parse flags from any position
 DEPLOY_CONTRACTS=false
 START_FRONTEND=false
+START_SERVICES=false
 MAIN_CMD=""
-for arg in "$@"; do
-  case "$arg" in
-    --deploy)   DEPLOY_CONTRACTS=true ;;
-    --frontend) START_FRONTEND=true ;;
-    *)          [ -z "$MAIN_CMD" ] && MAIN_CMD="$arg" ;;
+ARGS=("$@")
+i=0
+while [ $i -lt ${#ARGS[@]} ]; do
+  case "${ARGS[$i]}" in
+    --deploy)     DEPLOY_CONTRACTS=true ;;
+    --frontend)   START_FRONTEND=true ;;
+    --services)   START_SERVICES=true ;;
+    --full-stack) DEPLOY_CONTRACTS=true; START_FRONTEND=true; START_SERVICES=true ;;
+    --vaults)     i=$((i + 1)); NUM_VAULTS="${ARGS[$i]}"
+                  STARKNET_ACCOUNTS=$((NUM_VAULTS + 7))
+                  ISSUER_INDEX=$((NUM_VAULTS + 1))
+                  REDEEMER_INDEX=$((NUM_VAULTS + 2))
+                  RELAYER_INDEX=$((NUM_VAULTS + 3))
+                  ORACLE_INDEX=$((NUM_VAULTS + 4)) ;;
+    *)            [ -z "$MAIN_CMD" ] && MAIN_CMD="${ARGS[$i]}" ;;
   esac
+  i=$((i + 1))
 done
 MAIN_CMD="${MAIN_CMD:-start}"
 export DEPLOY_CONTRACTS
 export START_FRONTEND
+export START_SERVICES
 
 case "${MAIN_CMD}" in
   start)    start_all ;;
@@ -917,18 +1405,21 @@ case "${MAIN_CMD}" in
   reset)    reset_all ;;
   health)   health_check ;;
   *)
-    echo "Usage: $0 {start|stop|status|reset|health} [--deploy] [--frontend]"
+    echo "Usage: $0 {start|stop|status|reset|health} [--deploy] [--frontend] [--services] [--full-stack]"
     echo ""
     echo "Commands:"
     echo "  start    Start Zcash regtest + Starknet devnet (default)"
-    echo "  stop     Stop all services (incl. frontend if running)"
+    echo "  stop     Stop all services (incl. frontend, relayer, vault-daemon)"
     echo "  status   Show service status"
     echo "  reset    Wipe state and restart"
     echo "  health   Run health checks on running services"
     echo ""
     echo "Flags:"
-    echo "  --deploy    Build and deploy Cairo contracts after chains start"
-    echo "  --frontend  Also start the Next.js frontend dev server on port ${FRONTEND_PORT}"
+    echo "  --deploy      Build and deploy Cairo contracts after chains start"
+    echo "  --frontend    Also start the Next.js frontend dev server on port ${FRONTEND_PORT}"
+    echo "  --services    Register vault(s), start relayer & vault-daemon"
+    echo "  --vaults N    Number of vaults to register (default: ${NUM_VAULTS})"
+    echo "  --full-stack  Equivalent to --deploy --frontend --services"
     exit 1
     ;;
 esac

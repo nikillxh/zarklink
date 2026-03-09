@@ -1,6 +1,6 @@
 "use client";
 
-import {
+import React, {
   createContext,
   useContext,
   useState,
@@ -17,6 +17,8 @@ export interface DevnetAccount {
   address: string;
   private_key: string;
   label: string;
+  /** Zcash Sapling shielded address (mapped by start-devnet.sh) */
+  zcash_shielded?: string;
 }
 
 interface AccountContextValue {
@@ -45,7 +47,7 @@ const AccountContext = createContext<AccountContextValue>({
 
 // ── Parse accounts from env var ──────────────────────────────────────────────
 
-function loadAccounts(): DevnetAccount[] {
+function loadAccountsFromEnv(): DevnetAccount[] {
   try {
     const raw = process.env.NEXT_PUBLIC_DEVNET_ACCOUNTS;
     if (!raw) return [];
@@ -60,8 +62,20 @@ function loadAccounts(): DevnetAccount[] {
 // ── Provider ─────────────────────────────────────────────────────────────────
 
 export function AccountProvider({ children }: { children: ReactNode }) {
-  const accounts = useMemo(() => loadAccounts(), []);
+  const [accounts, setAccounts] = useState<DevnetAccount[]>(() => loadAccountsFromEnv());
   const [selectedIndex, setSelectedIndex] = useState(0);
+
+  // If env var parsing failed (empty), try loading from the static JSON file
+  // that start-devnet.sh writes to frontend/public/devnet-accounts.json
+  React.useEffect(() => {
+    if (accounts.length > 0) return;
+    fetch("/devnet-accounts.json")
+      .then((r) => (r.ok ? r.json() : []))
+      .then((data) => {
+        if (Array.isArray(data) && data.length > 0) setAccounts(data);
+      })
+      .catch(() => {});
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
   const current = accounts[selectedIndex] ?? null;
 

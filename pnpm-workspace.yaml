@@ -1,0 +1,6 @@
+packages:
+  - cli
+  - frontend
+  - relayer
+  - vault-daemon
+  - tests

@@ -45,7 +45,7 @@ Maintains a public registry of all active vaults.
 - `starknet_address: ContractAddress` — vault operator's Starknet account
 - `zcash_shielded_addr: (d, pk_d)` — vault's Zcash Sapling payment address
 - `collateral_amount: u256` — locked STRK/ETH collateral on Starknet
-- `status: VaultStatus` — {Active, Locked, Suspended, Liquidated}
+- `status: VaultStatus` — {Inactive (0, default), Active (1), Locked (2), Suspended (3), Liquidated (4)}
 - `last_proof_of_balance: u64` — block at which last PoB was submitted
 - `last_proof_of_capacity: u64` — block at which last PoC was submitted
 
@@ -252,7 +252,7 @@ factor of the prior, meaning no vault gains significant information.
 | **Relayer** | TypeScript + starknet.js | Block header submission pipeline |
 | **Vault Daemon** | TypeScript + zcash-lib | Automated vault operations |
 | **CLI** | TypeScript + Commander.js | User-facing bridge interaction |
-| **Frontend** | Next.js 14 + TailwindCSS | Modern bridge UI |
+| **Frontend** | Next.js 16 + TailwindCSS 4 | Modern bridge UI with API routes |
 | **Local Dev** | Katana (Starknet devnet) + zcashd (regtest) | Local testing infrastructure |
 | **Oracle** | Pragma Oracle (Starknet-native) | Price feeds |
 
@@ -262,80 +262,107 @@ factor of the prior, meaning no vault gains significant information.
 
 ```
 neo-zarklink/
-├── contracts/                    # Cairo smart contracts (Scarb project)
+├── contracts/                     # Cairo smart contracts (Scarb 2.16.0)
 │   ├── src/
-│   │   ├── vault_registry.cairo  # Vault registration and collateral
-│   │   ├── zcash_relay.cairo     # Zcash light client / header relay
-│   │   ├── bridge_protocol.cairo # Issue/Redeem state machine
-│   │   ├── wzec_token.cairo      # wZEC ERC-20 token
-│   │   ├── oracle.cairo          # Exchange rate oracle
-│   │   └── lib.cairo             # Module root
-│   ├── tests/
-│   │   └── *.cairo               # Contract test suites
+│   │   ├── lib.cairo              # Module root — declares all contract modules
+│   │   ├── bridge_protocol.cairo  # Issue/Redeem state machine + challenge logic
+│   │   ├── vault_registry.cairo   # Vault registration, collateral, lifecycle
+│   │   ├── vault_pool.cairo       # Pooled collateral & request assignment
+│   │   ├── wzec_token.cairo       # wZEC ERC-20 token (mint/burn restricted)
+│   │   ├── zcash_relay.cairo      # Zcash block header relay (light client)
+│   │   └── oracle.cairo           # TWAP exchange rate oracle
+│   ├── tests/                     # Cairo unit tests (91 tests)
+│   │   ├── test_bridge_protocol.cairo
+│   │   ├── test_vault_registry.cairo
+│   │   ├── test_vault_pool.cairo
+│   │   ├── test_wzec_token.cairo
+│   │   ├── test_zcash_relay.cairo
+│   │   └── test_oracle.cairo
 │   └── Scarb.toml
 │
-├── prover/                       # ZK proof circuits (Rust)
-│   ├── src/
-│   │   ├── circuits/
-│   │   │   ├── mint_proof.rs     # Issue proof circuit
-│   │   │   ├── burn_proof.rs     # Redeem proof circuit
-│   │   │   ├── challenge.rs      # Challenge proof circuit
-│   │   │   ├── balance.rs        # Proof of balance circuit
-│   │   │   └── capacity.rs       # Proof of capacity circuit
-│   │   ├── lib.rs
-│   │   └── main.rs
-│   └── Cargo.toml
+├── frontend/                      # Next.js 16 web application
+│   └── src/
+│       ├── app/                   # Page routes
+│       │   ├── page.tsx           # / — Dashboard (bridge stats, relay, pool)
+│       │   ├── layout.tsx         # Root layout (Navbar, Footer, providers)
+│       │   ├── bridge/page.tsx    # /bridge — Issue & Redeem with devnet auto-completion
+│       │   ├── vaults/page.tsx    # /vaults — Vault registry browser (auto-refresh)
+│       │   ├── relay/page.tsx     # /relay — Zcash header relay status
+│       │   ├── api/
+│       │   │   └── zcash-balance/
+│       │   │       └── route.ts   # GET /api/zcash-balance — proxies zcashd RPC
+│       │   ├── globals.css        # Tailwind CSS 4 + custom theme
+│       │   └── not-found.tsx      # 404 page
+│       ├── components/
+│       │   ├── Navbar.tsx         # Top navigation with wallet connector
+│       │   ├── WalletConnector.tsx # Account selector (devnet/browser wallet)
+│       │   ├── StatCard.tsx       # Reusable stats display card
+│       │   └── Footer.tsx         # Page footer
+│       ├── context/
+│       │   ├── AccountContext.tsx  # Manages selected devnet account state
+│       │   └── WalletContext.tsx   # Wallet connection provider
+│       ├── hooks/
+│       │   └── useStarknet.ts     # All contract read hooks (auto-refresh support)
+│       └── lib/
+│           └── starknet.ts        # Provider config, ABIs, error utilities
 │
-├── relayer/                      # Block header relayer service
-│   ├── src/
-│   │   ├── index.ts
-│   │   ├── zcash-client.ts       # Zcash node RPC client
-│   │   ├── starknet-client.ts    # Starknet contract interaction
-│   │   ├── header-pipeline.ts    # Header verification pipeline
-│   │   └── config.ts
-│   ├── package.json
-│   └── tsconfig.json
+├── relayer/                       # Zcash → Starknet header relay service
+│   └── src/
+│       ├── index.ts               # Service entry point
+│       ├── config.ts              # Loads .env.devnet config
+│       ├── header-pipeline.ts     # Batches & submits block headers
+│       ├── starknet-client.ts     # Starknet contract interaction
+│       └── zcash-client.ts        # Zcash RPC client (getblock, etc.)
 │
-├── vault-daemon/                 # Vault operator daemon
-│   ├── src/
-│   │   ├── index.ts
-│   │   ├── monitor.ts            # Event monitoring
-│   │   ├── zcash-ops.ts          # Zcash shielded operations
-│   │   ├── prover-client.ts      # ZK proof generation client
-│   │   └── config.ts
-│   ├── package.json
-│   └── tsconfig.json
+├── vault-daemon/                  # Vault operator automation daemon
+│   └── src/
+│       ├── index.ts               # Service entry point
+│       ├── config.ts              # Loads .env.devnet config
+│       ├── monitor.ts             # Polls Starknet events for bridge requests
+│       ├── prover-client.ts       # ZK proof generation stub
+│       └── zcash-ops.ts           # Zcash shielded transaction management
 │
-├── cli/                          # CLI tool
-│   ├── src/
-│   │   ├── index.ts
-│   │   ├── commands/
-│   │   │   ├── issue.ts
-│   │   │   ├── redeem.ts
-│   │   │   ├── vault.ts
-│   │   │   ├── status.ts
-│   │   │   └── relayer.ts
-│   │   ├── splitter.ts           # Splitting strategy implementation
-│   │   └── utils.ts
-│   ├── package.json
-│   └── tsconfig.json
+├── cli/                           # Bridge CLI tool
+│   └── src/
+│       ├── index.ts               # Commander.js entry point
+│       ├── commands/
+│       │   ├── issue.ts           # zarklink issue <amount>
+│       │   ├── redeem.ts          # zarklink redeem <amount>
+│       │   ├── vault.ts           # zarklink vault register|status
+│       │   ├── status.ts          # zarklink status <tx_id>
+│       │   └── relayer.ts         # zarklink relayer start
+│       ├── splitter.ts            # Privacy splitting algorithm (powers-of-2)
+│       └── utils.ts               # Shared helpers
 │
-├── frontend/                     # Next.js bridge UI
-│   ├── app/
-│   ├── components/
-│   ├── lib/
-│   ├── styles/
-│   ├── package.json
-│   └── next.config.js
+├── tests/                         # Integration tests (TypeScript)
+│   └── src/
+│       ├── run-all.ts             # Test runner
+│       ├── harness.ts             # Test infrastructure setup
+│       ├── test-e2e-flow.ts       # End-to-end issue/redeem flow
+│       ├── test-registry.ts       # VaultRegistry integration tests
+│       ├── test-pool.ts           # VaultPool integration tests
+│       ├── test-relay.ts          # ZcashRelay integration tests
+│       ├── test-wzec.ts           # wZEC token integration tests
+│       └── test-oracle.ts         # Oracle integration tests
 │
-├── scripts/                      # Infrastructure scripts
-│   ├── start-devnet.sh           # Start local chains + fund accounts
-│   └── deploy.sh                 # Deploy contracts to devnet
+├── scripts/
+│   ├── start-devnet.sh            # Full infrastructure orchestrator (~1400 lines)
+│   ├── deploy.sh                  # Scarb build + deploy wrapper (bash)
+│   ├── deploy.ts                  # TypeScript deployment script (starknet.js)
+│   └── install-deps.sh            # Dependency installer (interactive)
 │
-├── docs/                         # Additional documentation
+├── .devnet/                       # Generated at runtime (gitignored)
+│   ├── deployments.json           # Contract addresses + class hashes
+│   ├── accounts.json              # Combined Starknet + Zcash accounts
+│   ├── starknet-accounts-labeled.json
+│   ├── zcash-accounts.json
+│   └── logs/                      # Service log files
 │
-├── ARCHITECTURE.md               # This file
-└── README.md                     # Project README
+├── pnpm-workspace.yaml            # pnpm workspace: frontend, relayer, etc.
+├── package.json                   # Root workspace config
+├── .env.devnet                    # Auto-generated env vars (all services)
+├── ARCHITECTURE.md                # This file — detailed technical docs
+└── README.md                      # Quick start, usage, troubleshooting
 ```
 
 ---
@@ -425,3 +452,518 @@ Instead of individual vault selection (which leaks information), liquidity is
 - **Dual Bridge Mode** — shielded + express mode (lower latency, less privacy)
 - **MEV Protection** — commit-reveal for redeem requests
 - **Herodotus Storage Proofs** — direct Zcash state verification via L1 anchors
+
+---
+
+## 12. Implementation Notes
+
+Critical technical details for developers working on the codebase.
+
+### 12.1 Cairo VaultStatus Enum Mapping
+
+The `VaultStatus` enum in Cairo has **5 variants** with these discriminants:
+
+```cairo
+pub enum VaultStatus {
+    #[default]
+    Inactive,     // 0 — newly created, not yet active
+    Active,       // 1 — registered and collateral deposited
+    Locked,       // 2 — collateral locked during bridge operation
+    Suspended,    // 3 — failed proof requirements
+    Liquidated,   // 4 — collateral slashed
+}
+```
+
+The frontend `vaultStatusLabel()` in `frontend/src/lib/starknet.ts` must match
+these exact indices. Enum variant 0 is `Inactive` (the `#[default]`), NOT `Active`.
+
+### 12.2 VaultInfo Serde Serialization
+
+Cairo's `Serde` trait serializes `u256` as **two felts** (low, high). When reading
+vault data via raw `provider.callContract()`, the felt indices are:
+
+| Index | Field | Type | Notes |
+|-------|-------|------|-------|
+| 0 | owner | ContractAddress | 1 felt |
+| 1 | zcash_addr_d | felt252 | 1 felt |
+| 2 | zcash_addr_pkd | felt252 | 1 felt |
+| 3 | collateral (low) | u256 | 2 felts |
+| 4 | collateral (high) | | |
+| 5 | status | u8 (VaultStatus) | 1 felt |
+| 6 | last_proof_of_balance | u64 | 1 felt |
+| 7 | last_proof_of_capacity | u64 | 1 felt |
+| 8 | registered_at | u64 | 1 felt |
+| 9 | total_issued (low) | u256 | 2 felts |
+| 10 | total_issued (high) | | |
+| 11 | total_redeemed (low) | u256 | 2 felts |
+| 12 | total_redeemed (high) | | |
+
+**However**, when using `Contract.call()` with a proper ABI (as the frontend does),
+starknet.js v9 auto-decodes u256 into a single BigInt. So the decoded indices are:
+
+| Index | Field | Decoded Type |
+|-------|-------|-------------|
+| 0 | owner | string (hex) |
+| 1 | zcash_addr_d | bigint |
+| 2 | zcash_addr_pkd | bigint |
+| 3 | collateral | bigint (full u256) |
+| 4 | status | number (0–4) |
+| 5 | last_proof_of_balance | bigint |
+| 6 | last_proof_of_capacity | bigint |
+| 7 | registered_at | bigint |
+| 8 | total_issued | bigint (full u256) |
+| 9 | total_redeemed | bigint (full u256) |
+
+### 12.3 Vault IDs — 0-Indexed
+
+Vault IDs on-chain are **0-indexed** (`vault_count` starts at 0, first vault gets
+ID 0). The frontend displays them as 1-based (`id: i + 1`) for user-friendliness.
+
+### 12.4 Dual Collateral Deposit
+
+Vault collateral must be deposited to **both** contracts:
+
+1. **VaultRegistry** — `deposit_collateral(amount)` — updates the vault's
+   `collateral` field (read by frontend and used for display)
+2. **VaultPool** — `deposit_collateral(amount)` — updates pool accounting
+   (`vault_deposits`, `total_deposited`, used for request assignment capacity)
+
+Both are accounting-only (no token transfer — the wZEC is held after `approve`).
+The `start-devnet.sh` vault setup performs: register → mint → approve → registry deposit → pool deposit.
+
+### 12.5 Next.js Environment Loading
+
+Next.js reads `frontend/.env.local` **only at server startup**. If contracts are
+redeployed, the frontend must be restarted to pick up new addresses. The
+`start-devnet.sh` script handles this by stopping and restarting the frontend
+whenever env files are regenerated.
+
+### 12.6 Zcash Balance API Route
+
+The frontend includes a server-side API route at `/api/zcash-balance` that proxies
+`z_getbalance` / `z_gettotalbalance` calls to zcashd. This is necessary because
+browsers cannot call zcashd directly (CORS restrictions + HTTP Basic Auth credentials).
+
+**Route:** `GET /api/zcash-balance?address=<zcash-shielded-addr>`
+
+- With `?address=z...` → returns `{ balance: "1.23", address: "z..." }`
+- Without address → returns `{ transparent, private, total }` wallet totals
+- On error → returns `{ balance: "—", error: "..." }` (graceful degradation)
+
+**Server-only credentials** (not exposed to browser via `NEXT_PUBLIC_` prefix):
+```bash
+ZCASH_RPC_USER=zarklink         # .env.local (server-only)
+ZCASH_RPC_PASS=<auto-generated>  # .env.local (server-only)
+```
+
+> **Note:** Requires `output: "export"` to be REMOVED from `next.config.mjs`
+> because API routes are not compatible with static export mode.
+
+### 12.7 Devnet Auto-Completion Flow
+
+On devnet, the **vault daemon's event polling** is unreliable (starknet-devnet-rs
+has limited support for `getEvents`). To make the bridge fully functional for
+local development and demos, the **frontend itself completes the entire multi-step
+bridge protocol** by acting as both the user and the vault operator.
+
+#### Issue (3-step auto-completion)
+```
+1. request_lock(amount, warranty)           — as user account
+2. submit_mint(req_id, proof, block, ...)    — as user account
+   └── Uses finalized block trick (see §12.8)
+3. confirm_issue(req_id)                    — as vault operator account
+   └── Vault operator = devnet accounts[vault_id + 1]
+```
+
+#### Redeem (2-step auto-completion)
+```
+1. submit_burn(commitment, amount, warranty, proof)  — as user account
+   └── Pre-validates wZEC balance client-side before submitting
+2. confirm_redeem(req_id, proof, block)               — as vault operator account
+   └── Uses the same finalized block trick
+```
+
+The vault operator account is determined by `accounts[vault_id + 1]` from the
+devnet accounts list (account 0 is deployer, accounts 1–8 are vault operators).
+
+### 12.8 Finalized Block Trick
+
+For devnet, the `submit_mint` and `confirm_redeem` functions need an inclusion proof
+that passes `ZcashRelay.verify_inclusion()`. The relay's `verify_inclusion` computes:
+```
+root ← hash(note_commitment, merkle_path)
+assert root == stored_commitment_root[block_height]
+```
+
+The trick: if we set `note_commitment = commitment_root` and `merkle_path = []` (empty),
+then `hash(root, []) = root`, and the assertion becomes `root == root` → passes.
+
+```typescript
+// Frontend helper: findFinalizedBlock()
+for height in chain_tip..0:
+  if relay.is_finalized(height):
+    root = relay.get_commitment_root(height)
+    if root != 0:
+      return { height, root }  // Use root as both commitment and proof
+```
+
+This only works on devnet where we control the relay data. In production, real
+Merkle inclusion proofs from Zcash blocks would be required.
+
+### 12.9 starknet.js Logger
+
+starknet.js v9.4.2 emits `WARN: Insufficient transaction data for fee estimation`
+during devnet transactions (harmless — the tip estimation lacks historical block data).
+Both `scripts/deploy.ts` and the inline vault setup code suppress this with:
+```typescript
+import { logger } from 'starknet';
+logger.setLogLevel('ERROR');
+```
+
+### 12.10 Error Decoding
+
+Cairo contract reverts return error messages as hex-encoded felt252 short strings.
+For example, `0x496e73756666696369656e742062616c616e6365` → "Insufficient balance".
+
+`frontend/src/lib/starknet.ts` provides two utilities:
+
+- **`decodeContractError(raw)`** — Extracts hex strings from RPC error messages,
+  decodes them as UTF-8, and returns the readable text.
+- **`friendlyTxError(err)`** — Maps decoded errors to user-friendly messages with
+  actionable hints. Returns `{ message, hints[] }`.
+
+**Known contract errors and their friendly mappings:**
+| Contract Error | Friendly Message | Hints |
+|----------------|-----------------|-------|
+| Insufficient balance | "Insufficient wZEC balance for this operation." | Check account, switch accounts |
+| Warranty too low | "Warranty collateral too low." | Increase warranty amount |
+| No active vaults | "No active vaults available." | Run --services |
+| Zero | "Amount must be greater than zero." | — |
+| Not vault operator | "Not authorized as vault operator." | Use vault operator account |
+| CONTRACT_NOT_FOUND | "Contracts not deployed." | Run --deploy |
+
+### 12.11 Devnet Orchestration Flow
+
+`start-devnet.sh reset --full-stack` performs these steps in order:
+
+```
+1. Kill all existing services
+2. Wipe .devnet/ state directory
+3. Start zcashd (regtest) → wait for wallet ready (~80s)
+4. Fund Zcash accounts (mine blocks, create shielded addresses, z_sendmany)
+5. Start starknet-devnet-rs → wait for port 5050
+6. Fetch 15 predeployed Starknet accounts
+7. Generate .env.devnet (environment file)
+8. Save combined accounts to .devnet/accounts.json
+9. Build Cairo contracts (scarb build)
+10. Deploy 6 contracts via deploy.ts (declare → deploy → configure)
+11. Generate frontend/.env.local (NEXT_PUBLIC_* vars)
+12. Set up 8 vault operators:
+    a. Grant deployer temporary mint authority
+    b. For each vault: register → mint wZEC → approve → deposit registry → deposit pool
+    c. Restore bridge authority to BridgeProtocol
+13. Mine 10 extra Zcash blocks for relay finality
+14. Start relayer service
+15. Start vault daemon
+16. Start Next.js frontend → wait for port 3000
+17. Print status table
+```
+
+### 12.12 Devnet Account Layout
+
+With `NUM_VAULTS=8` (default), 15 predeployed accounts are allocated:
+
+| Index | Role | Account Label |
+|-------|------|--------------|
+| 0 | Deployer / Admin | Contract deployment, post-deploy config |
+| 1–8 | Vault Operators | Registered vaults with collateral |
+| 9 | Issuer (Alice) | Locks ZEC → mints wZEC |
+| 10 | Redeemer (Dave) | Burns wZEC → unlocks ZEC |
+| 11 | Relayer Service | Header submission account |
+| 12 | Oracle Service | Price feed updates |
+| 13–14 | Test Users | Additional test accounts |
+
+---
+
+## 13. Code Map
+
+A file-by-file guide to the entire codebase. Use this to find where any piece of
+logic lives.
+
+### Smart Contracts (`contracts/src/`)
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│ lib.cairo                                                           │
+│   Module root. Declares: bridge_protocol, vault_registry,           │
+│   vault_pool, wzec_token, zcash_relay, oracle                      │
+├─────────────────────────────────────────────────────────────────────┤
+│ bridge_protocol.cairo                 ~700 lines                    │
+│   ┌─ Storage: requests, request_count, vault_pool, vault_registry, │
+│   │  wzec_token, zcash_relay, timeouts (mint/confirm/redeem)       │
+│   ├─ constructor(admin, pool, registry, token, relay, oracle)      │
+│   ├─ request_lock(amount, warranty) → request_id                   │
+│   │  Assigns vault via pool, creates IssueRequest, locks warranty  │
+│   ├─ submit_mint(req_id, proof, block, nullifier, ciphertext)      │
+│   │  Verifies ZcashRelay inclusion, transitions to AwaitConfirm    │
+│   ├─ confirm_issue(req_id) — vault confirms → mints wZEC to issuer │
+│   ├─ challenge_issue(req_id, secret, proof) — encryption fraud     │
+│   ├─ submit_burn(commitment, amount, warranty, proof)              │
+│   │  Burns wZEC, creates RedeemRequest, assigns vault              │
+│   ├─ confirm_redeem(req_id, proof, block) — vault proves ZEC sent  │
+│   ├─ challenge_redeem(req_id, secret, proof) — vault fraud proof   │
+│   ├─ expire_issue / expire_redeem — timeout slashing               │
+│   └─ Events: IssueLockRequested, MintSubmitted, IssueConfirmed,    │
+│      BurnSubmitted, RedeemConfirmed, VaultSlashed                  │
+├─────────────────────────────────────────────────────────────────────┤
+│ vault_registry.cairo                  ~400 lines                    │
+│   ┌─ Storage: vaults (Map<u32, VaultInfo>), vault_count,           │
+│   │  vault_by_owner, has_vault, admin, bridge_protocol             │
+│   ├─ constructor(admin)                                             │
+│   ├─ register_vault(zcash_d, zcash_pkd) → sets Active status      │
+│   ├─ deposit_collateral(amount) — adds to vault.collateral         │
+│   ├─ get_vault(id) → VaultInfo (13 raw felts / 10 ABI-decoded)    │
+│   ├─ get_vault_count() → u32                                       │
+│   ├─ is_vault_active(id) → bool                                    │
+│   ├─ slash_vault(id, amount) — called by bridge on misbehavior     │
+│   ├─ submit_proof_of_balance / submit_proof_of_capacity            │
+│   └─ set_bridge_protocol(addr) — admin-only, sets authorized caller│
+├─────────────────────────────────────────────────────────────────────┤
+│ vault_pool.cairo                      ~350 lines                    │
+│   ┌─ Storage: vault_deposits, total_deposited, active_vault_count, │
+│   │  encumbered, wzec_token, registry, bridge_protocol             │
+│   ├─ constructor(admin, wzec_token, registry)                      │
+│   ├─ deposit_collateral(amount) — checks vault active via registry │
+│   ├─ withdraw_collateral(amount) — checks not encumbered           │
+│   ├─ assign_request(req_id) → vault_id — round-robin/random assign│
+│   ├─ encumber / release_encumbrance — lock during bridge ops       │
+│   ├─ get_pool_capacity() → u256                                    │
+│   ├─ get_active_vault_count() → u32                                │
+│   ├─ get_total_deposited() → u256                                  │
+│   └─ set_bridge_protocol(addr) — admin-only                        │
+├─────────────────────────────────────────────────────────────────────┤
+│ wzec_token.cairo                      ~300 lines                    │
+│   ┌─ Standard ERC-20 (SNIP-2): name, symbol, decimals, totalSupply │
+│   ├─ transfer / approve / transferFrom — standard functions         │
+│   ├─ mint(to, amount) — only callable by bridge_protocol            │
+│   ├─ burn(from, amount) — only callable by bridge_protocol          │
+│   └─ set_bridge(addr) — admin sets the authorized minter/burner    │
+├─────────────────────────────────────────────────────────────────────┤
+│ zcash_relay.cairo                     ~350 lines                    │
+│   ┌─ Storage: headers (Map<u32, BlockHeader>), chain_tip,          │
+│   │  finality_depth, authorized_relayers                           │
+│   ├─ constructor(admin, finality_depth)                             │
+│   ├─ submit_header(height, hash, prev_hash, merkle_root, ...)     │
+│   ├─ submit_headers_batch(headers: Array<BlockHeader>)             │
+│   ├─ verify_inclusion(commitment, merkle_path, height) → bool     │
+│   ├─ is_finalized(height) → bool — height + k ≤ chain_tip         │
+│   ├─ get_chain_tip / get_finalized_height / get_header_count       │
+│   └─ authorize_relayer(addr) — admin-only                          │
+├─────────────────────────────────────────────────────────────────────┤
+│ oracle.cairo                          ~200 lines                    │
+│   ┌─ Storage: current_rate, last_update, twap_window, admin        │
+│   ├─ constructor(admin, initial_rate)                               │
+│   ├─ update_rate(new_rate) — TWAP smoothing, circuit breaker       │
+│   ├─ get_rate() → u256                                             │
+│   └─ set_circuit_breaker_threshold(pct) — admin-only               │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+### Frontend (`frontend/src/`)
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│ lib/starknet.ts                       ~250 lines                    │
+│   ┌─ starknetConfig — reads NEXT_PUBLIC_* env vars at import time  │
+│   ├─ getProvider() → RpcProvider (singleton)                        │
+│   ├─ ABI definitions:                                               │
+│   │  REGISTRY_ABI — get_vault, get_vault_count, register, deposit  │
+│   │  RELAY_ABI    — get_chain_tip, get_finalized_height, count     │
+│   │  POOL_ABI     — active_vault_count, pool_capacity, deposited   │
+│   │  WZEC_ABI     — total_supply, balance_of, approve, transfer    │
+│   │  BRIDGE_ABI   — request_lock, submit_mint, confirm_issue, etc. │
+│   ├─ vaultStatusLabel(status: number) → string                     │
+│   │  Maps Cairo enum: 0→Inactive, 1→Active, 2→Locked,             │
+│   │  3→Suspended, 4→Liquidated                                     │
+│   ├─ vaultStatusColor(status: number) → Tailwind class             │
+│   └─ formatWzec(amount: bigint) → decimal string (8 decimals)      │
+├─────────────────────────────────────────────────────────────────────┤
+│ hooks/useStarknet.ts                  ~320 lines                    │
+│   ┌─ useVaultList(refreshMs) — fetches all vaults from VaultRegistry│
+│   │  Loops i=0..count-1 (0-indexed), returns id as i+1 (display)  │
+│   │  Fields: owner[0], collateral[3], status[4], zcash[1],        │
+│   │  totalIssued[8], totalRedeemed[9]                              │
+│   │  Auto-refresh via setInterval when refreshMs > 0               │
+│   ├─ useBridgeStats() — total supply, bridge request count          │
+│   ├─ useRelayStats(refreshMs) — chain tip, finalized height, count  │
+│   ├─ usePoolStats(refreshMs) — active vaults, pool capacity, total  │
+│   ├─ useWzecBalance(address, refreshMs) — wZEC balance for account  │
+│   └─ useZcashBalance(zcashAddr, refreshMs) — ZEC balance via API    │
+│      Fetches from /api/zcash-balance server route                   │
+├─────────────────────────────────────────────────────────────────────┤
+│ context/AccountContext.tsx            ~150 lines                    │
+│   ┌─ Parses NEXT_PUBLIC_DEVNET_ACCOUNTS (pipe-separated)           │
+│   │  Format: "label|address|privateKey|zcashAddr"                  │
+│   ├─ DevnetAccount type: { label, address, privateKey, zcashAddr } │
+│   └─ useAccounts() → { accounts, selected, setSelected }           │
+├─────────────────────────────────────────────────────────────────────┤
+│ context/WalletContext.tsx             ~100 lines                    │
+│   └─ Wallet connection state (devnet mode vs browser extension)     │
+├─────────────────────────────────────────────────────────────────────┤
+│ components/WalletConnector.tsx        ~200 lines                    │
+│   ┌─ Account dropdown (label → role assignment)                     │
+│   ├─ Always shows: Starknet address, Zcash address (with copy)     │
+│   └─ "More" toggle reveals private key                              │
+├─────────────────────────────────────────────────────────────────────┤
+│ app/page.tsx                          Dashboard                     │
+│   Uses useBridgeStats(), useRelayStatus(), usePoolStats()           │
+│   Displays 9 stat cards in 3x3 grid                                │
+├─────────────────────────────────────────────────────────────────────┤
+│ app/bridge/page.tsx                   Issue & Redeem  (~725 lines)  │
+│   Tab-based UI: Issue (ZEC→wZEC) and Redeem (wZEC→ZEC)            │
+│   ┌─ Balance display: wZEC (Starknet) + ZEC (Zcash) side by side  │
+│   ├─ handleIssue: 3-step devnet auto-completion                    │
+│   │  request_lock → submit_mint → confirm_issue (as vault op)      │
+│   ├─ handleRedeem: 2-step devnet auto-completion                   │
+│   │  Pre-validates wZEC balance → submit_burn → confirm_redeem     │
+│   ├─ findFinalizedBlock() — queries relay for finalized block root │
+│   ├─ getVaultOperatorAccount() — devnet accounts[vault_id + 1]     │
+│   ├─ Max button (redeem): fills input with full wZEC balance       │
+│   ├─ Step-by-step status messages during multi-step flows          │
+│   └─ Friendly error messages via friendlyTxError()                 │
+├─────────────────────────────────────────────────────────────────────┤
+│ app/vaults/page.tsx                   Vault Browser                 │
+│   Table showing all vaults: ID, owner (truncated), status,          │
+│   collateral, issued, redeemed. Uses useVaultList(15000).          │
+│   Filters Active vaults (status===1). Auto-refreshes every 15s.    │
+├─────────────────────────────────────────────────────────────────────┤
+├─────────────────────────────────────────────────────────────────────┤
+│ app/api/zcash-balance/route.ts        Zcash Balance API             │
+│   Server-side route proxying zcashd z_getbalance / z_gettotalbalance│
+│   Uses ZCASH_RPC_USER/PASS (server-only, NOT NEXT_PUBLIC_)         │
+│   Returns JSON: { balance, address } or { transparent, private }   │
+│   Graceful error handling: returns { balance: "—" } on failure     │
+├─────────────────────────────────────────────────────────────────────┤
+│ app/relay/page.tsx                    Relay Status                  │
+│   Chain tip, finalized height, header count. Uses useRelayStats().  │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+### Scripts (`scripts/`)
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│ start-devnet.sh                       ~1400 lines                   │
+│   ┌─ Configuration: NUM_VAULTS, ports, paths, colors                │
+│   ├─ start_zcashd()       — zcashd -regtest, wait for wallet       │
+│   ├─ fund_zcash()         — mine blocks, create shielded addrs     │
+│   ├─ start_starknet()     — starknet-devnet --seed 42              │
+│   ├─ fetch_accounts()     — GET /predeployed_accounts, label them   │
+│   ├─ generate_env()       — write .env.devnet                       │
+│   ├─ deploy_contracts()   — scarb build + tsx deploy.ts             │
+│   ├─ generate_frontend_env() — write frontend/.env.local            │
+│   ├─ setup_vault()        — inline tsx: register, mint, deposit     │
+│   ├─ start_relayer()      — pnpm -C relayer dev (background)       │
+│   ├─ start_vault_daemon() — pnpm -C vault-daemon dev (background)  │
+│   ├─ start_frontend()     — pnpm -C frontend dev (background)      │
+│   ├─ stop_all()           — kill PIDs for all services              │
+│   ├─ show_status()        — formatted service table                 │
+│   └─ Main: parse args → orchestrate steps → print summary          │
+├─────────────────────────────────────────────────────────────────────┤
+│ deploy.ts                             ~250 lines                    │
+│   ┌─ Reads .env.devnet for RPC + deployer key                      │
+│   ├─ Deploys 6 contracts in order:                                  │
+│   │  1. WzecToken(admin, name, symbol, decimals)                   │
+│   │  2. Oracle(admin, initial_rate)                                 │
+│   │  3. VaultRegistry(admin)                                        │
+│   │  4. ZcashRelay(admin, finality_depth=24)                       │
+│   │  5. VaultPool(admin, wzec_token, registry)                     │
+│   │  6. BridgeProtocol(admin, pool, registry, token, relay, oracle)│
+│   ├─ Post-deploy config:                                            │
+│   │  token.set_bridge(bridge), registry.set_bridge_protocol(bridge)│
+│   │  pool.set_bridge_protocol(bridge), relay.authorize_relayer     │
+│   ├─ Saves to .devnet/deployments.json                              │
+│   └─ Updates .env.devnet with contract addresses                    │
+├─────────────────────────────────────────────────────────────────────┤
+│ deploy.sh                             ~50 lines                     │
+│   Wrapper: scarb build → tsx deploy.ts                              │
+├─────────────────────────────────────────────────────────────────────┤
+│ install-deps.sh                       ~100 lines                    │
+│   Checks Node.js, pnpm/npm, Scarb, snforge, zcashd                │
+│   Prompts for pnpm vs npm, runs install                             │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+### Off-Chain Services
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│ relayer/src/                                                        │
+│   index.ts          — main loop: poll → batch → submit              │
+│   config.ts         — loads ZCASH_RELAY_CONTRACT, RPC URLs, keys    │
+│   zcash-client.ts   — getblock, getblockcount, getblockhash calls  │
+│   header-pipeline.ts— batches headers, calls submit_headers_batch   │
+│   starknet-client.ts— Account + Contract setup for relay contract   │
+├─────────────────────────────────────────────────────────────────────┤
+│ vault-daemon/src/                                                   │
+│   index.ts          — main loop: poll events → auto-respond         │
+│   config.ts         — loads all contract addresses + keys           │
+│   monitor.ts        — polls BridgeProtocol events for new requests  │
+│   zcash-ops.ts      — z_sendmany, z_getbalance for redeem flow     │
+│   prover-client.ts  — stub for ZK proof generation                  │
+├─────────────────────────────────────────────────────────────────────┤
+│ cli/src/                                                            │
+│   index.ts          — Commander.js program with subcommands         │
+│   commands/issue.ts — request_lock + submit_mint flow               │
+│   commands/redeem.ts— submit_burn + await confirm flow              │
+│   commands/vault.ts — register_vault + deposit + status             │
+│   commands/status.ts— query request status by ID                    │
+│   commands/relayer.ts— start relayer service                        │
+│   splitter.ts       — powers-of-2 splitting algorithm (§5.1)       │
+│   utils.ts          — hex formatting, provider creation             │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+### Data Flow Map
+
+```
+                    ┌─────────────┐
+                    │  User (Web)  │
+                    └──────┬──────┘
+                           │ http://localhost:3000
+                    ┌──────▼──────┐
+                    │  Frontend    │──── reads ──── frontend/.env.local
+                    │  (Next.js)   │              (NEXT_PUBLIC_* vars)
+                    └──────┬──────┘
+                           │ starknet.js Contract.call() / Account.execute()
+                    ┌──────▼──────┐
+                    │  Starknet    │──── port 5050
+                    │  Devnet      │
+                    │  ┌─────────┐ │
+                    │  │ Bridge  │ │◄── confirm/challenge ── Vault Daemon
+                    │  │ Protocol│ │
+                    │  └────┬────┘ │
+                    │       │      │
+                    │  ┌────▼────┐ │
+                    │  │ Vault   │ │    ┌────────────┐
+                    │  │ Registry│ │    │ Vault Pool │
+                    │  └─────────┘ │    └────────────┘
+                    │       │      │
+                    │  ┌────▼────┐ │
+                    │  │ wZEC    │ │    ┌────────────┐
+                    │  │ Token   │ │    │  Oracle    │
+                    │  └─────────┘ │    └────────────┘
+                    │       │      │
+                    │  ┌────▼────┐ │
+                    │  │ Zcash   │ │◄── submit_headers ── Relayer Service
+                    │  │ Relay   │ │
+                    │  └─────────┘ │
+                    └──────────────┘
+                           │
+              Zcash Relay verifies block headers from:
+                           │
+                    ┌──────▼──────┐
+                    │  zcashd      │──── port 18232
+                    │  (regtest)   │
+                    └─────────────┘
+```

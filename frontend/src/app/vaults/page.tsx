@@ -15,8 +15,8 @@ import { useAccount } from "@/context/AccountContext";
 import { formatZec, shortAddr, vaultStatusLabel } from "@/lib/starknet";
 
 export default function VaultsPage() {
-  const { vaults, loading: vaultsLoading } = useVaultList();
-  const { stats: pool } = usePoolStats();
+  const { vaults, loading: vaultsLoading, refetch: refetchVaults } = useVaultList(15000);
+  const { stats: pool } = usePoolStats(15000);
   const { current: account, getAccount } = useAccount();
   const [showRegister, setShowRegister] = useState(false);
   const [collateral, setCollateral] = useState("");
@@ -24,7 +24,8 @@ export default function VaultsPage() {
   const [submitting, setSubmitting] = useState(false);
 
   const totalCollateral = vaults.reduce((sum, v) => sum + v.collateral, 0n);
-  const activeVaults = vaults.filter((v) => v.status === 0);
+  // Cairo enum: 0=Inactive, 1=Active, 2=Locked, 3=Suspended, 4=Liquidated
+  const activeVaults = vaults.filter((v) => v.status === 1);
 
   async function handleRegister(e: React.FormEvent) {
     e.preventDefault();
