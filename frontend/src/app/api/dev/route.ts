@@ -6,6 +6,9 @@
 
 import { NextRequest, NextResponse } from "next/server";
 
+// Block in non-devnet environments
+const NETWORK = process.env.NEXT_PUBLIC_NETWORK ?? "devnet";
+
 const ZCASH_RPC_URL = process.env.NEXT_PUBLIC_ZCASH_RPC_URL ?? "http://127.0.0.1:18232";
 const ZCASH_RPC_USER = process.env.ZCASH_RPC_USER ?? "zarklink";
 const ZCASH_RPC_PASS = process.env.ZCASH_RPC_PASS ?? "";
@@ -27,6 +30,10 @@ async function zcashRpc(method: string, params: unknown[] = []): Promise<unknown
 
 // POST /api/dev  — body: { action, ...params }
 export async function POST(request: NextRequest) {
+  // Block in non-devnet environments
+  if (NETWORK !== "devnet") {
+    return NextResponse.json({ ok: false, error: "Dev API is only available on devnet" }, { status: 403 });
+  }
   try {
     const body = await request.json();
     const { action } = body;
@@ -62,46 +69,68 @@ export async function POST(request: NextRequest) {
           return NextResponse.json({ ok: false, error: "Missing address or amount" }, { status: 400 });
         }
 
-        // Get a transparent address with balance to send from.
-        // Prefer non-coinbase UTXOs; if all are coinbase, send exact UTXO amount.
-        const utxos = (await zcashRpc("listunspent", [1])) as Array<{
-          address: string; amount: number; generated?: boolean;
-        }>;
-        if (utxos.length === 0) {
-          return NextResponse.json({ ok: false, error: "No unspent UTXOs. Mine some blocks first." }, { status: 400 });
-        }
-
         const requestedAmt = parseFloat(amount);
 
-        // Prefer non-coinbase UTXO with enough balance
+        // Strategy: Try transparent UTXOs first (minconf=0), then shielded balance
         let fromAddr = "";
         let sendAmt = requestedAmt;
-        const nonCoinbase = utxos.filter(u => !u.generated && u.amount >= requestedAmt + 0.001);
-        if (nonCoinbase.length > 0) {
-          fromAddr = nonCoinbase[0].address;
-          sendAmt = requestedAmt;
-        } else {
-          // Use coinbase UTXO — must send exact amount (no change allowed)
-          const coinbase = utxos.filter(u => u.generated && u.amount >= requestedAmt);
-          if (coinbase.length > 0) {
-            fromAddr = coinbase[0].address;
-            sendAmt = coinbase[0].amount - 0.01; // leave margin for auto fee
-          } else if (utxos.length > 0) {
-            fromAddr = utxos[0].address;
+
+        // 1. Try transparent UTXOs (include unconfirmed with minconf=0)
+        const utxos = (await zcashRpc("listunspent", [0])) as Array<{
+          address: string; amount: number; generated?: boolean; confirmations?: number;
+        }>;
+
+        if (utxos.length > 0) {
+          // Prefer non-coinbase UTXO with enough balance
+          const nonCoinbase = utxos.filter(u => !u.generated && u.amount >= requestedAmt + 0.001);
+          if (nonCoinbase.length > 0) {
+            fromAddr = nonCoinbase[0].address;
             sendAmt = requestedAmt;
           } else {
-            return NextResponse.json({ ok: false, error: "No suitable UTXOs found" }, { status: 400 });
+            // Use mature coinbase UTXO (≥100 confirmations)
+            const matureCoinbase = utxos.filter(u => u.generated && (u.confirmations ?? 0) >= 100 && u.amount >= requestedAmt);
+            if (matureCoinbase.length > 0) {
+              fromAddr = matureCoinbase[0].address;
+              sendAmt = matureCoinbase[0].amount - 0.01; // leave margin for fee
+            } else {
+              // Any UTXO with sufficient balance
+              const any = utxos.filter(u => u.amount >= requestedAmt);
+              if (any.length > 0) {
+                fromAddr = any[0].address;
+                sendAmt = requestedAmt;
+              }
+            }
           }
         }
 
-        // z_sendmany from transparent → shielded (NoPrivacy for devnet)
+        // 2. If no transparent UTXOs, try sending from a shielded address
+        if (!fromAddr) {
+          const zAddrs = (await zcashRpc("z_listaddresses", [])) as string[];
+          for (const zA of zAddrs) {
+            const bal = (await zcashRpc("z_getbalance", [zA, 0])) as number;
+            if (bal >= requestedAmt + 0.001) {
+              fromAddr = zA;
+              sendAmt = requestedAmt;
+              break;
+            }
+          }
+        }
+
+        if (!fromAddr) {
+          return NextResponse.json({
+            ok: false,
+            error: "No funds available (transparent or shielded). Mine at least 101 blocks first — coinbase rewards need 100 confirmations to mature.",
+          }, { status: 400 });
+        }
+
+        // z_sendmany (works from both transparent and shielded addresses)
         // Use null fee to let zcashd auto-calculate ZIP 317 fee
         const opid = await zcashRpc("z_sendmany", [
           fromAddr,
           [{ address, amount: sendAmt }],
-          1,    // minconf
+          0,    // minconf=0 to allow unconfirmed inputs
           null, // auto-calculate fee (ZIP 317)
-          "NoPrivacy", // devnet: allow transparent change
+          "NoPrivacy", // devnet: allow any privacy level
         ]);
 
         return NextResponse.json({
@@ -204,6 +233,36 @@ export async function POST(request: NextRequest) {
           ok: true,
           balances,
           totals,
+        });
+      }
+
+      // ── Direct z_sendmany (from specific address) ────────────────
+      case "send_zec": {
+        // Send ZEC from a specific shielded/transparent address to a target.
+        // Used by the bridge Issue flow to transfer ZEC from issuer to vault.
+        const { from_address, to_address, amount: sendAmount } = body;
+        if (!from_address || !to_address || !sendAmount) {
+          return NextResponse.json({ ok: false, error: "Missing from_address, to_address, or amount" }, { status: 400 });
+        }
+        const amt = parseFloat(sendAmount);
+        if (isNaN(amt) || amt <= 0) {
+          return NextResponse.json({ ok: false, error: "Invalid amount" }, { status: 400 });
+        }
+
+        const opid = await zcashRpc("z_sendmany", [
+          from_address,
+          [{ address: to_address, amount: amt }],
+          0,    // minconf=0
+          null, // auto-fee (ZIP 317)
+          "AllowFullyTransparent",
+        ]);
+
+        return NextResponse.json({
+          ok: true,
+          operation_id: opid,
+          from: from_address,
+          to: to_address,
+          amount: amt,
         });
       }
 

@@ -149,9 +149,9 @@ export default function RelayPage() {
         ) : (
           <div className="text-center py-8">
             <Radio className="h-12 w-12 text-gray-600 mx-auto mb-3" />
-            <p className="text-gray-400">Relay not deployed yet</p>
+            <p className="text-gray-400">No relay data yet</p>
             <p className="text-sm text-gray-500 mt-1">
-              Deploy contracts and start the relayer service
+              Waiting for Zcash block headers to be relayed
             </p>
           </div>
         )}

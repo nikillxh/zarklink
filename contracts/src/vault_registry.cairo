@@ -45,6 +45,8 @@ pub trait IVaultRegistry<TContractState> {
   fn submit_proof_of_insolvency(ref self: TContractState, proof: Span<felt252>);
   fn slash_vault(ref self: TContractState, vault_id: u32, amount: u256);
   fn set_bridge_protocol(ref self: TContractState, bridge: ContractAddress);
+  fn record_issue(ref self: TContractState, vault_id: u32, amount: u256);
+  fn record_redeem(ref self: TContractState, vault_id: u32, amount: u256);
   fn update_vault_zcash_addr(
     ref self: TContractState,
     zcash_addr_d: felt252,
@@ -331,6 +333,24 @@ pub mod VaultRegistry {
       assert(caller == self.owner.read(), 'Only owner');
       self.bridge_protocol.write(bridge);
       self.emit(BridgeProtocolSet { bridge });
+    }
+
+    fn record_issue(ref self: ContractState, vault_id: u32, amount: u256) {
+      let caller = get_caller_address();
+      let bridge = self.bridge_protocol.read();
+      assert(caller == bridge, 'Only bridge protocol');
+      let mut vault = self.vaults.read(vault_id);
+      vault.total_issued = vault.total_issued + amount;
+      self.vaults.write(vault_id, vault);
+    }
+
+    fn record_redeem(ref self: ContractState, vault_id: u32, amount: u256) {
+      let caller = get_caller_address();
+      let bridge = self.bridge_protocol.read();
+      assert(caller == bridge, 'Only bridge protocol');
+      let mut vault = self.vaults.read(vault_id);
+      vault.total_redeemed = vault.total_redeemed + amount;
+      self.vaults.write(vault_id, vault);
     }
 
     fn update_vault_zcash_addr(

@@ -6,15 +6,19 @@ import {
   useState,
   useCallback,
   useMemo,
+  useEffect,
   type ReactNode,
 } from "react";
 import { Account, RpcProvider } from "starknet";
-import { getProvider, shortAddr } from "@/lib/starknet";
+import { getProvider, shortAddr, isDevnet, isTestnet } from "@/lib/starknet";
 import { useAccount, type DevnetAccount } from "@/context/AccountContext";
 
 // ── Types ────────────────────────────────────────────────────────────────────
 
 export type WalletMode = "devnet" | "browser";
+
+/** Wallet kind detected by starknetkit (or manual detection) */
+export type WalletKind = "argentX" | "braavos" | "metamask" | "unknown";
 
 interface WalletContextValue {
   /** Current active mode */
@@ -25,9 +29,11 @@ interface WalletContextValue {
   displayAddress: string;
   /** Whether a wallet is connected */
   isConnected: boolean;
+  /** Which wallet is connected (for display) */
+  walletKind: WalletKind;
   /** Get a starknet.js Account instance for the active wallet */
   getSigner: () => Account | null;
-  /** Connect a browser wallet (ArgentX / Braavos) */
+  /** Connect a browser wallet (ArgentX / Braavos / MetaMask Snap) */
   connectBrowserWallet: () => Promise<void>;
   /** Disconnect browser wallet */
   disconnectBrowserWallet: () => void;
@@ -42,6 +48,7 @@ const WalletContext = createContext<WalletContextValue>({
   address: null,
   displayAddress: "Not connected",
   isConnected: false,
+  walletKind: "unknown",
   getSigner: () => null,
   connectBrowserWallet: async () => {},
   disconnectBrowserWallet: () => {},
@@ -49,7 +56,7 @@ const WalletContext = createContext<WalletContextValue>({
   error: null,
 });
 
-// ── Starknet window wallet detection ─────────────────────────────────────────
+// ── Starknet window wallet detection (fallback for when starknetkit is unavailable) ──
 
 interface StarknetWindowObject {
   id: string;
@@ -68,50 +75,90 @@ interface StarknetWindowObject {
   off: (event: string, handler: (...args: unknown[]) => void) => void;
 }
 
-function getStarknetWallets(): StarknetWindowObject[] {
-  if (typeof window === "undefined") return [];
-
-  const wallets: StarknetWindowObject[] = [];
-
-  // Check for standard starknet wallet objects
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const win = window as any;
-
-  if (win.starknet_argentX) {
-    wallets.push(win.starknet_argentX);
-  }
-  if (win.starknet_braavos) {
-    wallets.push(win.starknet_braavos);
-  }
-  if (win.starknet && !wallets.find((w) => w.id === win.starknet?.id)) {
-    wallets.push(win.starknet);
-  }
-
-  return wallets;
+function detectWalletKind(id: string): WalletKind {
+  if (id.includes("argent")) return "argentX";
+  if (id.includes("braavos")) return "braavos";
+  if (id.includes("metamask")) return "metamask";
+  return "unknown";
 }
 
 // ── Provider ─────────────────────────────────────────────────────────────────
 
 export function WalletProvider({ children }: { children: ReactNode }) {
   const devnetAccount = useAccount();
-  const [mode, setMode] = useState<WalletMode>("devnet");
+  const [mode, setMode] = useState<WalletMode>(isDevnet ? "devnet" : "browser");
   const [browserAddress, setBrowserAddress] = useState<string | null>(null);
   const [browserWallet, setBrowserWallet] = useState<StarknetWindowObject | null>(null);
+  const [walletKind, setWalletKind] = useState<WalletKind>("unknown");
   const [error, setError] = useState<string | null>(null);
 
   const connectBrowserWallet = useCallback(async () => {
     setError(null);
     try {
-      const wallets = getStarknetWallets();
+      // Try starknetkit first — it supports MetaMask Snap, ArgentX, Braavos,
+      // and shows a nice connection modal.
+      // NOTE: starknetkit has peerDep starknet ^8, we use ^9.
+      // We only use it for wallet discovery + address; we create our own
+      // starknet.js Account for signing.
+      const starknetkit = await import("starknetkit").catch(() => null);
+
+      if (starknetkit) {
+        const result = await starknetkit.connect({
+          modalMode: "alwaysAsk",
+          modalTheme: "dark",
+          dappName: "Zarklink Bridge",
+        } as Parameters<typeof starknetkit.connect>[0]);
+
+        const connectorData = result?.connectorData;
+        const connector = result?.connector;
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const walletObj = result?.wallet as any;
+
+        const addr = connectorData?.account
+          ?? walletObj?.selectedAddress
+          ?? walletObj?.account?.address;
+
+        if (!addr) {
+          setError("Wallet connected but no address returned. Try again.");
+          return;
+        }
+
+        // Determine wallet kind from connector id or wallet id
+        const connId = (connector as { id?: string })?.id
+          ?? walletObj?.id
+          ?? "";
+        setWalletKind(detectWalletKind(connId));
+
+        // Store the wallet object for signing
+        if (walletObj) {
+          setBrowserWallet(walletObj as StarknetWindowObject);
+        }
+
+        setBrowserAddress(addr);
+        setMode("browser");
+        return;
+      }
+
+      // Fallback: manual wallet detection (no starknetkit available)
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const win = window as any;
+      const wallets: StarknetWindowObject[] = [];
+      if (win.starknet_argentX) wallets.push(win.starknet_argentX);
+      if (win.starknet_braavos) wallets.push(win.starknet_braavos);
+      if (win.starknet_metamask) wallets.push(win.starknet_metamask);
+      if (win.starknet && !wallets.find((w) => w.id === win.starknet?.id)) {
+        wallets.push(win.starknet);
+      }
+
       if (wallets.length === 0) {
         setError(
-          "No Starknet wallet found. Install ArgentX or Braavos browser extension.\n" +
+          "No Starknet wallet found. Install ArgentX, Braavos, or MetaMask (with Starknet Snap).\n" +
           "For local devnet, use the devnet accounts instead."
         );
         return;
       }
 
-      const wallet = wallets[0]; // Use first available wallet
+      const wallet = wallets[0];
       const addresses = await wallet.enable({ starknetVersion: "v5" });
       const addr = addresses[0] ?? wallet.selectedAddress ?? wallet.account?.address;
 
@@ -120,18 +167,32 @@ export function WalletProvider({ children }: { children: ReactNode }) {
         return;
       }
 
+      setWalletKind(detectWalletKind(wallet.id));
       setBrowserWallet(wallet);
       setBrowserAddress(addr);
       setMode("browser");
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Failed to connect wallet");
+      // User rejection is not an error
+      const msg = err instanceof Error ? err.message : String(err);
+      if (msg.includes("User rejected") || msg.includes("user rejected") || msg.includes("UserRejected")) {
+        return;
+      }
+      setError(msg || "Failed to connect wallet");
     }
   }, []);
 
-  const disconnectBrowserWallet = useCallback(() => {
+  const disconnectBrowserWallet = useCallback(async () => {
+    try {
+      const starknetkit = await import("starknetkit").catch(() => null);
+      if (starknetkit?.disconnect) {
+        await starknetkit.disconnect({ clearLastWallet: true });
+      }
+    } catch { /* ignore */ }
+
     setBrowserWallet(null);
     setBrowserAddress(null);
-    setMode("devnet");
+    setWalletKind("unknown");
+    setMode(isDevnet ? "devnet" : "browser");
     setError(null);
   }, []);
 
@@ -155,21 +216,34 @@ export function WalletProvider({ children }: { children: ReactNode }) {
       return devnetAccount.getAccount();
     }
 
-    // For browser wallets, create an Account connected to the wallet's provider
+    // For browser wallets, use the wallet's native account object for signing
     if (browserWallet && browserAddress) {
-      // When using browser wallet, the wallet itself acts as the signer
-      // We create a connected account using the wallet's provider
+      // The wallet extension manages signing internally via its request() API.
+      // We wrap it in an Account that delegates execute calls to the wallet.
       const provider = getProvider();
-      // Note: in production, you'd use the wallet's built-in signing.
-      // For devnet testing with browser wallets pointed at localhost:5050,
-      // the wallet manages signing internally.
-      return new Account({
+      const account = new Account({
         provider,
         address: browserAddress,
-        // Browser wallets handle signing internally — we pass a dummy
-        // that will be overridden by the wallet's internal signer
-        signer: "0x0",
+        signer: browserWallet as any, // wallet implements Signer interface
       });
+      // Override execute to use wallet's request method for proper signing
+      const originalExecute = account.execute.bind(account);
+      account.execute = async function(calls: any, details?: any) {
+        try {
+          // Try native wallet signing via starknet window object
+          const result = await browserWallet!.request({
+            type: "starknet_addInvokeTransaction",
+            params: {
+              calls: Array.isArray(calls) ? calls : [calls],
+            },
+          }) as any;
+          return { transaction_hash: result.transaction_hash ?? result };
+        } catch {
+          // Fallback to standard execute
+          return originalExecute(calls, details);
+        }
+      } as any;
+      return account;
     }
 
     return null;
@@ -181,13 +255,14 @@ export function WalletProvider({ children }: { children: ReactNode }) {
       address,
       displayAddress,
       isConnected,
+      walletKind,
       getSigner,
       connectBrowserWallet,
       disconnectBrowserWallet,
       setMode,
       error,
     }),
-    [mode, address, displayAddress, isConnected, getSigner, connectBrowserWallet, disconnectBrowserWallet, error],
+    [mode, address, displayAddress, isConnected, walletKind, getSigner, connectBrowserWallet, disconnectBrowserWallet, error],
   );
 
   return (

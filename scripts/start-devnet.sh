@@ -12,7 +12,10 @@
 #   ./scripts/start-devnet.sh --frontend            # Start + launch Next.js dev
 #   ./scripts/start-devnet.sh --deploy --frontend   # Deploy + frontend
 #   ./scripts/start-devnet.sh --services            # Register vault + start relayer/vault-daemon
-#   ./scripts/start-devnet.sh --full-stack          # Everything (deploy + services + frontend)
+#   ./scripts/start-devnet.sh --script0             # Enhanced setup: 8 vaults (varying collateral) + fund users + seed relay
+#   ./scripts/start-devnet.sh --script1             # Simulate: issues, redeems, slashing, multi-user funding
+#   ./scripts/start-devnet.sh --full-infra          # Deploy + 8 vaults (script0) + services + frontend
+#   ./scripts/start-devnet.sh --full-stack          # Full-infra + simulation (script1)
 #   ./scripts/start-devnet.sh stop                  # Stop all services
 #   ./scripts/start-devnet.sh status                # Check service status
 #   ./scripts/start-devnet.sh reset                 # Wipe state and restart
@@ -34,9 +37,14 @@ ZCASH_DIR="${DATA_DIR}/zcash"
 ZCASH_CONF="${ZCASH_DIR}/zcash.conf"
 ZCASH_RPC_PORT=18232
 ZCASH_RPC_USER="zarklink"
-ZCASH_RPC_PASS="zarklink-dev-$(date +%s | sha256sum | head -c 16)"
+# Reuse the saved password if zcash.conf already exists (so status/stop/health work
+# across invocations), otherwise generate a new one for fresh setups.
+if [ -f "${ZCASH_CONF}" ]; then
+  ZCASH_RPC_PASS=$(grep '^rpcpassword=' "${ZCASH_CONF}" 2>/dev/null | cut -d= -f2-)
+fi
+ZCASH_RPC_PASS="${ZCASH_RPC_PASS:-zarklink-dev-$(date +%s | sha256sum | head -c 16)}"
 ZCASH_MINERS=3
-ZCASH_INITIAL_BLOCKS=110
+ZCASH_INITIAL_BLOCKS=200
 
 # ── Number of vault operators to register ─────────────────────────────────
 # Change this default to control how many vaults are created in devnet.
@@ -258,8 +266,8 @@ start_zcash() {
     fi
     sleep 2
     rpc_waited=$((rpc_waited + 2))
-    if [ $rpc_waited -ge 120 ]; then
-      log_error "zcashd wallet failed to load within 120s"
+    if [ $rpc_waited -ge 420 ]; then
+      log_error "zcashd wallet failed to load within 420s"
       return 1
     fi
   done
@@ -274,14 +282,19 @@ zcash_rpc() {
     -rpcuser="${ZCASH_RPC_USER}" \
     -rpcpassword="${ZCASH_RPC_PASS}" \
     -rpcport="${ZCASH_RPC_PORT}" \
-    "$@" 2>/dev/null
+    "$@"
+}
+
+# Quiet variant — suppresses stderr (for calls where failure is expected/handled)
+zcash_rpc_quiet() {
+  zcash_rpc "$@" 2>/dev/null
 }
 
 fund_zcash_accounts() {
   log_header "Funding Zcash Regtest Accounts (${NUM_VAULTS} vaults)"
 
   local block_count
-  block_count=$(zcash_rpc getblockcount 2>/dev/null || echo "0")
+  block_count=$(zcash_rpc_quiet getblockcount || echo "0")
 
   if [ "$block_count" -lt "$ZCASH_INITIAL_BLOCKS" ]; then
     log_info "Mining ${ZCASH_INITIAL_BLOCKS} initial blocks..."
@@ -322,16 +335,30 @@ fund_zcash_accounts() {
   log_info "  Redeemer: ${redeemer_z_addr:0:20}...${redeemer_z_addr: -8}"
 
   # Fund transparent addresses (for shielding later)
+  # sendtoaddress uses mature coinbase UTXOs from the initial blocks.
+  # Zcash coinbase requires 100-block maturity; with 200 blocks mined,
+  # blocks 1-100 are mature (~1000 ZEC spendable).
+   # We need ~90 ZEC total (40 for vaults + 50 for users + fees).
+  # Fund each T-addr with 55 ZEC (enough for any batch including ZIP 317 fees).
   log_info "Funding transparent addresses..."
   for addr in "${t_addrs[@]}"; do
-    zcash_rpc sendtoaddress "$addr" 250.0 >/dev/null 2>&1 || true
+    zcash_rpc sendtoaddress "$addr" 55.0 >/dev/null || log_warn "  sendtoaddress to ${addr} failed"
   done
+  # Mine blocks to confirm transparent transfers
   zcash_rpc generate 10 >/dev/null
 
   # Shield funds to Sapling addresses in batches
+  # NOTE: zcashd v6+ requires explicit privacyPolicy for transparent→shielded transfers.
+  # "AllowFullyTransparent" is required because:
+  #   1. Sending FROM a t-addr reveals the sender (needs AllowRevealedSenders)
+  #   2. Change goes back to a t-addr which reveals recipients (needs AllowRevealedRecipients)
+  #   3. AllowFullyTransparent covers both cases
+  # Fee is set to 'null' to let zcashd auto-calculate ZIP 317 fees.
+  # zcash-cli z_sendmany <from_addr> <recipients_json> <minconf> <fee> <privacyPolicy>
   log_info "Shielding funds to Sapling addresses..."
   local batch_json="" batch_count=0 funder_idx=0
   local per_vault="5.0"
+  local all_opids=()
 
   for i in $(seq 0 $((NUM_VAULTS - 1))); do
     [ -z "$batch_json" ] && batch_json="[" || batch_json+=","
@@ -341,8 +368,14 @@ fund_zcash_accounts() {
     if [ "$batch_count" -ge 5 ] || [ "$i" -eq $((NUM_VAULTS - 1)) ]; then
       batch_json+="]"
       local opid
-      opid=$(zcash_rpc z_sendmany "${t_addrs[$funder_idx]}" "$batch_json" 1 0.0001 2>/dev/null || true)
-      [ -n "$opid" ] && log_info "  Vault batch (${batch_count} addrs): ${opid}"
+      opid=$(zcash_rpc z_sendmany "${t_addrs[$funder_idx]}" "$batch_json" 1 null "AllowFullyTransparent" 2>&1)
+      local rpc_exit=$?
+      if [ $rpc_exit -eq 0 ] && [ -n "$opid" ] && [[ "$opid" == opid-* ]]; then
+        log_info "  Vault batch (${batch_count} addrs): ${opid}"
+        all_opids+=("$opid")
+      else
+        log_warn "  Vault batch (${batch_count} addrs) FAILED (exit=$rpc_exit): ${opid}"
+      fi
       batch_json="" ; batch_count=0
       funder_idx=$(( (funder_idx + 1) % ${#t_addrs[@]} ))
     fi
@@ -351,16 +384,74 @@ fund_zcash_accounts() {
   # Fund issuer and redeemer
   local user_batch="[{\"address\":\"${issuer_z_addr}\",\"amount\":25.0},{\"address\":\"${redeemer_z_addr}\",\"amount\":25.0}]"
   local opid_users
-  opid_users=$(zcash_rpc z_sendmany "${t_addrs[$funder_idx]}" "$user_batch" 1 0.0001 2>/dev/null || true)
-  [ -n "$opid_users" ] && log_info "  User batch: ${opid_users}"
+  opid_users=$(zcash_rpc z_sendmany "${t_addrs[$funder_idx]}" "$user_batch" 1 null "AllowFullyTransparent" 2>&1)
+  local user_exit=$?
+  if [ $user_exit -eq 0 ] && [ -n "$opid_users" ] && [[ "$opid_users" == opid-* ]]; then
+    log_info "  User batch: ${opid_users}"
+    all_opids+=("$opid_users")
+  else
+    log_warn "  User batch FAILED (exit=$user_exit): ${opid_users}"
+  fi
+
+  # Wait for all z_sendmany operations to complete before mining
+  if [ ${#all_opids[@]} -gt 0 ]; then
+    log_info "Waiting for ${#all_opids[@]} shielded transfers to complete..."
+    local op_timeout=180
+    for opid in "${all_opids[@]}"; do
+      local op_waited=0
+      while [ "$op_waited" -lt "$op_timeout" ]; do
+        local status
+        status=$(zcash_rpc_quiet z_getoperationstatus "[\"${opid}\"]" || echo "[]")
+        if echo "$status" | grep -q '"success"'; then
+          log_info "  ${opid}: success"
+          break
+        elif echo "$status" | grep -q '"failed"'; then
+          local err_msg
+          err_msg=$(echo "$status" | grep -o '"message":"[^"]*"' | head -1 || echo "unknown")
+          log_warn "  ${opid}: FAILED — ${err_msg}"
+          break
+        fi
+        sleep 2
+        op_waited=$((op_waited + 2))
+      done
+      if [ "$op_waited" -ge "$op_timeout" ]; then
+        log_warn "  ${opid}: timed out after ${op_timeout}s (still executing/queued)"
+      fi
+    done
+  fi
 
   # Mine blocks to confirm shielded transfers
-  sleep 3
+  sleep 2
   zcash_rpc generate 20 >/dev/null
+  # Allow wallet time to scan new blocks containing Sapling outputs
+  sleep 5
+
+  # Verify shielded balances were actually funded
+  log_info "Verifying shielded balances..."
+  local funded_count=0
+  for z_addr in "${vault_z_addrs[@]}"; do
+    local bal
+    bal=$(zcash_rpc_quiet z_getbalance "$z_addr" || echo "0")
+    # Check if balance is non-zero (works without bc)
+    if [ -n "$bal" ] && [ "$bal" != "0" ] && [ "$bal" != "0.00000000" ]; then
+      funded_count=$((funded_count + 1))
+    fi
+  done
+  log_info "  Vaults funded: ${funded_count}/${NUM_VAULTS}"
+  
+  local issuer_bal redeemer_bal
+  issuer_bal=$(zcash_rpc_quiet z_getbalance "$issuer_z_addr" || echo "0")
+  redeemer_bal=$(zcash_rpc_quiet z_getbalance "$redeemer_z_addr" || echo "0")
+  log_info "  Issuer balance:   ${issuer_bal} ZEC"
+  log_info "  Redeemer balance: ${redeemer_bal} ZEC"
+
+  if [ "$funded_count" -eq 0 ]; then
+    log_warn "WARNING: No vault accounts were funded! Check zcashd z_sendmany logs."
+  fi
 
   # Get balances
   local total_balance
-  total_balance=$(zcash_rpc z_gettotalbalance 2>/dev/null || echo "{}")
+  total_balance=$(zcash_rpc_quiet z_gettotalbalance || echo "{}")
 
   log_success "Zcash accounts funded (${NUM_VAULTS} vaults + issuer + redeemer)"
   log_info "Total balance: ${total_balance}"
@@ -397,8 +488,18 @@ ZACCTS_PY
 stop_zcash() {
   if is_running "zcashd"; then
     log_info "Stopping zcashd..."
-    zcash_rpc stop 2>/dev/null || kill "$(get_pid zcashd)" 2>/dev/null || true
-    sleep 3
+    zcash_rpc_quiet stop || kill "$(get_pid zcashd)" 2>/dev/null || true
+    # Wait for zcashd to fully exit (release DB locks)
+    local waited=0
+    while pgrep -x zcashd >/dev/null 2>&1 && [ $waited -lt 30 ]; do
+      sleep 1
+      waited=$((waited + 1))
+    done
+    if pgrep -x zcashd >/dev/null 2>&1; then
+      log_warn "zcashd still running after 30s, killing..."
+      pkill -9 -x zcashd 2>/dev/null || true
+      sleep 2
+    fi
     log_success "zcashd stopped"
   else
     log_info "zcashd is not running"
@@ -415,6 +516,17 @@ start_starknet() {
   if is_running "starknet-devnet"; then
     log_warn "starknet-devnet is already running (PID: $(get_pid starknet-devnet))"
     return 0
+  fi
+
+  # Also check if devnet is running externally (e.g. in a separate terminal)
+  if curl -s "http://${STARKNET_HOST}:${STARKNET_PORT}/is_alive" 2>/dev/null | grep -q "Alive"; then
+    local ext_pid
+    ext_pid=$(pgrep -f "starknet-devnet.*--port ${STARKNET_PORT}" 2>/dev/null | head -1)
+    if [ -n "$ext_pid" ]; then
+      save_pid "starknet-devnet" "$ext_pid"
+      log_warn "starknet-devnet already running externally (PID: $ext_pid) — adopting"
+      return 0
+    fi
   fi
 
   starknet-devnet \
@@ -625,6 +737,10 @@ EOF
     deployer_pk=$(python3 -c "import json; d=json.load(open('${DATA_DIR}/starknet-accounts.json')); print(d[0]['private_key'])" 2>/dev/null || echo "")
 
     if [ -n "$deployer_addr" ]; then
+      local relayer_addr relayer_pk
+      relayer_addr=$(python3 -c "import json; d=json.load(open('${DATA_DIR}/starknet-accounts.json')); print(d[${RELAYER_INDEX}]['address'])" 2>/dev/null || echo "")
+      relayer_pk=$(python3 -c "import json; d=json.load(open('${DATA_DIR}/starknet-accounts.json')); print(d[${RELAYER_INDEX}]['private_key'])" 2>/dev/null || echo "")
+
       cat >> "${ENV_FILE}" <<EOF
 
 # Deployer Account (auto-assigned from predeployed accounts[0])
@@ -642,6 +758,14 @@ ISSUER_PRIVATE_KEY=$(python3 -c "import json; d=json.load(open('${DATA_DIR}/star
 # Redeemer Account (accounts[NUM_VAULTS+2])
 REDEEMER_ADDRESS=$(python3 -c "import json; d=json.load(open('${DATA_DIR}/starknet-accounts.json')); print(d[${REDEEMER_INDEX}]['address'])" 2>/dev/null || echo "")
 REDEEMER_PRIVATE_KEY=$(python3 -c "import json; d=json.load(open('${DATA_DIR}/starknet-accounts.json')); print(d[${REDEEMER_INDEX}]['private_key'])" 2>/dev/null || echo "")
+
+# Relayer Account (accounts[NUM_VAULTS+3])
+RELAYER_ADDRESS=${relayer_addr}
+RELAYER_PRIVATE_KEY=${relayer_pk}
+
+# Oracle Account (accounts[NUM_VAULTS+4])
+ORACLE_ADDRESS=$(python3 -c "import json; d=json.load(open('${DATA_DIR}/starknet-accounts.json')); print(d[${ORACLE_INDEX}]['address'])" 2>/dev/null || echo "")
+ORACLE_PRIVATE_KEY=$(python3 -c "import json; d=json.load(open('${DATA_DIR}/starknet-accounts.json')); print(d[${ORACLE_INDEX}]['private_key'])" 2>/dev/null || echo "")
 EOF
     fi
   fi
@@ -736,6 +860,9 @@ generate_frontend_env() {
 # ==========================================================================
 # This file was generated by start-devnet.sh. It provides the NEXT_PUBLIC_*
 # environment variables consumed by the Next.js frontend at build/dev time.
+
+# ── Network Mode ─────────────────────────────────────────────────────────
+NEXT_PUBLIC_NETWORK=devnet
 
 # ── Chain RPC Endpoints ──────────────────────────────────────────────────
 NEXT_PUBLIC_STARKNET_RPC_URL=http://${STARKNET_HOST}:${STARKNET_PORT}
@@ -1141,7 +1268,7 @@ show_status() {
   # zcashd
   if is_running "zcashd"; then
     local zec_blocks
-    zec_blocks=$(zcash_rpc getblockcount 2>/dev/null || echo "?")
+    zec_blocks=$(zcash_rpc_quiet getblockcount || echo "?")
     echo -e "  zcashd               ${GREEN}RUNNING${NC}         $(get_pid zcashd)     ${ZCASH_RPC_PORT}  (${zec_blocks} blocks)"
   else
     echo -e "  zcashd               ${RED}STOPPED${NC}"
@@ -1150,6 +1277,10 @@ show_status() {
   # starknet-devnet
   if is_running "starknet-devnet"; then
     echo -e "  starknet-devnet      ${GREEN}RUNNING${NC}         $(get_pid starknet-devnet)     ${STARKNET_PORT}"
+  elif curl -s "http://${STARKNET_HOST}:${STARKNET_PORT}/is_alive" 2>/dev/null | grep -q "Alive"; then
+    local devnet_pid
+    devnet_pid=$(pgrep -f "starknet-devnet.*--port ${STARKNET_PORT}" 2>/dev/null | head -1)
+    echo -e "  starknet-devnet      ${GREEN}RUNNING${NC}         ${devnet_pid:-?}     ${STARKNET_PORT}  (external)"
   else
     echo -e "  starknet-devnet      ${RED}STOPPED${NC}"
   fi
@@ -1254,13 +1385,26 @@ start_all() {
   # Setup vault + start off-chain services if --services flag was passed
   if [ "${START_SERVICES:-false}" = "true" ]; then
     if [ -f "${DATA_DIR}/deployments.json" ]; then
-      setup_vault
+      # If --script0 was also requested, use enhanced setup instead of basic
+      if [ "${RUN_SCRIPT0:-false}" = "true" ]; then
+        run_script0
+      else
+        setup_vault
+      fi
       mine_relay_blocks
       start_relayer
       start_vault_daemon
     else
       log_warn "Contracts not deployed — skipping service startup (use --deploy --services)"
     fi
+  elif [ "${RUN_SCRIPT0:-false}" = "true" ]; then
+    # script0 requested standalone (without --services)
+    run_script0
+  fi
+
+  # Run simulation script if --script1 was passed
+  if [ "${RUN_SCRIPT1:-false}" = "true" ]; then
+    run_script1
   fi
 
   # Start frontend if --frontend flag was passed
@@ -1300,6 +1444,82 @@ start_all() {
 }
 
 # ---------------------------------------------------------------------------
+# Script 0 — Enhanced Setup (varying collateral, funded users, relay seeding)
+# ---------------------------------------------------------------------------
+run_script0() {
+  log_header "Running Script 0 — Enhanced Devnet Setup"
+
+  if [ ! -f "${DATA_DIR}/deployments.json" ]; then
+    log_error "No deployments found — deploy contracts first (--deploy)"
+    return 1
+  fi
+
+  local pm
+  pm=$(detect_pkg_manager)
+
+  local tsx_bin=""
+  if [ -x "${PROJECT_ROOT}/relayer/node_modules/.bin/tsx" ]; then
+    tsx_bin="${PROJECT_ROOT}/relayer/node_modules/.bin/tsx"
+  elif [ "$pm" = "pnpm" ]; then
+    tsx_bin="pnpm exec tsx"
+  else
+    tsx_bin="npx tsx"
+  fi
+
+  export NODE_PATH="${PROJECT_ROOT}/relayer/node_modules"
+
+  if [ -f "${PROJECT_ROOT}/.env.devnet" ]; then
+    set -a
+    source "${PROJECT_ROOT}/.env.devnet"
+    set +a
+  fi
+
+  ${tsx_bin} "${PROJECT_ROOT}/scripts/devscript0-setup.ts" || {
+    log_warn "Script 0 had warnings (see output above)"
+  }
+
+  log_success "Script 0 complete"
+}
+
+# ---------------------------------------------------------------------------
+# Script 1 — Simulate Bridge Activity
+# ---------------------------------------------------------------------------
+run_script1() {
+  log_header "Running Script 1 — Simulate Bridge Activity"
+
+  if [ ! -f "${DATA_DIR}/deployments.json" ]; then
+    log_error "No deployments found — run script0 first"
+    return 1
+  fi
+
+  local pm
+  pm=$(detect_pkg_manager)
+
+  local tsx_bin=""
+  if [ -x "${PROJECT_ROOT}/relayer/node_modules/.bin/tsx" ]; then
+    tsx_bin="${PROJECT_ROOT}/relayer/node_modules/.bin/tsx"
+  elif [ "$pm" = "pnpm" ]; then
+    tsx_bin="pnpm exec tsx"
+  else
+    tsx_bin="npx tsx"
+  fi
+
+  export NODE_PATH="${PROJECT_ROOT}/relayer/node_modules"
+
+  if [ -f "${PROJECT_ROOT}/.env.devnet" ]; then
+    set -a
+    source "${PROJECT_ROOT}/.env.devnet"
+    set +a
+  fi
+
+  ${tsx_bin} "${PROJECT_ROOT}/scripts/devscript1-simulate.ts" || {
+    log_warn "Script 1 had warnings (see output above)"
+  }
+
+  log_success "Script 1 complete"
+}
+
+# ---------------------------------------------------------------------------
 # Health Check
 # ---------------------------------------------------------------------------
 health_check() {
@@ -1310,7 +1530,7 @@ health_check() {
   # Check zcashd
   if is_running "zcashd"; then
     local info
-    info=$(zcash_rpc getblockchaininfo 2>/dev/null)
+    info=$(zcash_rpc_quiet getblockchaininfo)
     if [ -n "$info" ]; then
       log_success "zcashd: healthy"
     else
@@ -1374,6 +1594,8 @@ health_check() {
 DEPLOY_CONTRACTS=false
 START_FRONTEND=false
 START_SERVICES=false
+RUN_SCRIPT0=false
+RUN_SCRIPT1=false
 MAIN_CMD=""
 ARGS=("$@")
 i=0
@@ -1382,7 +1604,10 @@ while [ $i -lt ${#ARGS[@]} ]; do
     --deploy)     DEPLOY_CONTRACTS=true ;;
     --frontend)   START_FRONTEND=true ;;
     --services)   START_SERVICES=true ;;
-    --full-stack) DEPLOY_CONTRACTS=true; START_FRONTEND=true; START_SERVICES=true ;;
+    --script0)    RUN_SCRIPT0=true ;;
+    --script1)    RUN_SCRIPT1=true ;;
+    --full-infra) DEPLOY_CONTRACTS=true; START_SERVICES=true; START_FRONTEND=true; RUN_SCRIPT0=true ;;
+    --full-stack) DEPLOY_CONTRACTS=true; START_SERVICES=true; START_FRONTEND=true; RUN_SCRIPT0=true; RUN_SCRIPT1=true ;;
     --vaults)     i=$((i + 1)); NUM_VAULTS="${ARGS[$i]}"
                   STARKNET_ACCOUNTS=$((NUM_VAULTS + 7))
                   ISSUER_INDEX=$((NUM_VAULTS + 1))
@@ -1397,6 +1622,8 @@ MAIN_CMD="${MAIN_CMD:-start}"
 export DEPLOY_CONTRACTS
 export START_FRONTEND
 export START_SERVICES
+export RUN_SCRIPT0
+export RUN_SCRIPT1
 
 case "${MAIN_CMD}" in
   start)    start_all ;;
@@ -1405,7 +1632,7 @@ case "${MAIN_CMD}" in
   reset)    reset_all ;;
   health)   health_check ;;
   *)
-    echo "Usage: $0 {start|stop|status|reset|health} [--deploy] [--frontend] [--services] [--full-stack]"
+    echo "Usage: $0 {start|stop|status|reset|health} [flags]"
     echo ""
     echo "Commands:"
     echo "  start    Start Zcash regtest + Starknet devnet (default)"
@@ -1418,8 +1645,21 @@ case "${MAIN_CMD}" in
     echo "  --deploy      Build and deploy Cairo contracts after chains start"
     echo "  --frontend    Also start the Next.js frontend dev server on port ${FRONTEND_PORT}"
     echo "  --services    Register vault(s), start relayer & vault-daemon"
+    echo "  --script0     Enhanced setup: 8 vaults with varying collateral, fund users, seed relay"
+    echo "  --script1     Simulate bridge activity: issues, redeems, vault dynamics"
     echo "  --vaults N    Number of vaults to register (default: ${NUM_VAULTS})"
-    echo "  --full-stack  Equivalent to --deploy --frontend --services"
+    echo ""
+    echo "Combo flags:"
+    echo "  --full-infra  --deploy + --services + --script0 + --frontend (fully provisioned)"
+    echo "  --full-stack  --full-infra + --script1 (fully provisioned + simulated activity)"
+    echo ""
+    echo "Examples:"
+    echo "  $0                                 # Just start chains"
+    echo "  $0 --deploy                        # Start + deploy contracts"
+    echo "  $0 --deploy --services             # Start + deploy + basic vault setup + services"
+    echo "  $0 --full-infra                    # Everything up, 8 vaults with varying collateral"
+    echo "  $0 --full-stack                    # Full infrastructure + simulated bridge activity"
+    echo "  $0 reset --full-stack              # Wipe state + full rebuild"
     exit 1
     ;;
 esac

@@ -3,6 +3,14 @@
   "private": true,
   "description": "Privacy-Preserving Zcash Bridge to Starknet",
   "pnpm": {
-    "onlyBuiltDependencies": ["esbuild", "sharp", "unrs-resolver"]
+    "onlyBuiltDependencies": [
+      "esbuild",
+      "sharp",
+      "unrs-resolver"
+    ]
+  },
+  "dependencies": {
+    "starknet": "^9.4.2",
+    "tsx": "^4.21.0"
   }
 }

@@ -4,7 +4,7 @@ import { useState, useCallback } from "react";
 import { Wallet, ChevronDown, Unplug, Monitor, Globe, Copy, Check, Eye, EyeOff } from "lucide-react";
 import { useWallet, type WalletMode } from "@/context/WalletContext";
 import { useAccount } from "@/context/AccountContext";
-import { shortAddr } from "@/lib/starknet";
+import { shortAddr, isDevnet, zcashCoinName } from "@/lib/starknet";
 
 // ── Clipboard copy button ────────────────────────────────────────────────────
 
@@ -44,6 +44,16 @@ function CopyField({ label, value }: { label: string; value: string }) {
   );
 }
 
+/** Human-readable wallet name */
+function walletKindLabel(kind: string): string {
+  switch (kind) {
+    case "argentX": return "ArgentX";
+    case "braavos": return "Braavos";
+    case "metamask": return "MetaMask (Snap)";
+    default: return "Wallet";
+  }
+}
+
 export default function WalletConnector() {
   const [open, setOpen] = useState(false);
   const [showDetails, setShowDetails] = useState(false);
@@ -76,6 +86,7 @@ export default function WalletConnector() {
           <div className="p-3 border-b border-brand-border">
             <p className="text-xs text-gray-400 mb-2">Connection Mode</p>
             <div className="flex gap-2">
+              {isDevnet && (
               <button
                 onClick={() => wallet.setMode("devnet")}
                 className={`flex-1 flex items-center justify-center gap-1.5 py-1.5 rounded-lg text-xs font-medium transition-all ${
@@ -87,6 +98,7 @@ export default function WalletConnector() {
                 <Monitor className="h-3.5 w-3.5" />
                 Devnet
               </button>
+              )}
               <button
                 onClick={() => {
                   wallet.setMode("browser");
@@ -129,7 +141,7 @@ export default function WalletConnector() {
                         {shortAddr(acc.address, 4)}
                       </span>
                       {acc.zcash_shielded && (
-                        <span className="ml-1 text-[10px] text-brand-blue">ZEC</span>
+                        <span className="ml-1 text-[10px] text-brand-blue">{zcashCoinName()}</span>
                       )}
                     </button>
                   ))}
@@ -144,7 +156,9 @@ export default function WalletConnector() {
               {wallet.address ? (
                 <div className="space-y-2">
                   <div className="flex items-center justify-between">
-                    <span className="text-xs text-gray-400">Connected</span>
+                    <span className="text-xs text-gray-400">
+                      Connected via {walletKindLabel(wallet.walletKind)}
+                    </span>
                     <span className="text-xs font-mono text-green-400">
                       {shortAddr(wallet.address)}
                     </span>
@@ -166,7 +180,7 @@ export default function WalletConnector() {
                     Connect Wallet
                   </button>
                   <p className="text-xs text-gray-500 text-center">
-                    ArgentX or Braavos required
+                    ArgentX, Braavos, or MetaMask (Starknet Snap)
                   </p>
                   {wallet.error && (
                     <p className="text-xs text-red-400 text-center">{wallet.error}</p>
@@ -181,7 +195,7 @@ export default function WalletConnector() {
             <div className="border-t border-brand-border px-3 py-3 space-y-2.5">
               <div className="flex items-center justify-between">
                 <p className="text-xs font-medium text-gray-300">
-                  {wallet.mode === "devnet" && devnetAccount ? devnetAccount.label : "Account"}
+                  {wallet.mode === "devnet" && devnetAccount ? devnetAccount.label : walletKindLabel(wallet.walletKind)}
                 </p>
                 <button
                   onClick={() => setShowDetails(!showDetails)}
@@ -212,6 +226,13 @@ export default function WalletConnector() {
                     <CopyField label="Private Key (devnet only)" value={devnetAccount.private_key} />
                   )}
                 </>
+              )}
+
+              {wallet.mode === "browser" && showDetails && (
+                <div>
+                  <span className="text-[10px] text-gray-500 uppercase tracking-wider">Wallet Type</span>
+                  <p className="text-[11px] text-gray-300 mt-0.5">{walletKindLabel(wallet.walletKind)}</p>
+                </div>
               )}
             </div>
           )}

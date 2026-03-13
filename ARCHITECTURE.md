@@ -299,16 +299,18 @@ neo-zarklink/
 │       │   └── not-found.tsx      # 404 page
 │       ├── components/
 │       │   ├── Navbar.tsx         # Top navigation with wallet connector
-│       │   ├── WalletConnector.tsx # Account selector (devnet/browser wallet)
+│       │   ├── WalletConnector.tsx # Account selector (devnet/browser/MetaMask)
 │       │   ├── StatCard.tsx       # Reusable stats display card
 │       │   └── Footer.tsx         # Page footer
 │       ├── context/
 │       │   ├── AccountContext.tsx  # Manages selected devnet account state
-│       │   └── WalletContext.tsx   # Wallet connection provider
+│       │   ├── WalletContext.tsx   # Wallet connection (starknetkit + MetaMask Snap)
+│       │   ├── ZcashAccountContext.tsx # Zcash↔Starknet address association (localStorage)
+│       │   └── BridgeContext.tsx   # Bridge form state persistence across navigation
 │       ├── hooks/
 │       │   └── useStarknet.ts     # All contract read hooks (auto-refresh support)
 │       └── lib/
-│           └── starknet.ts        # Provider config, ABIs, error utilities
+│           └── starknet.ts        # Provider config, ABIs, error utilities, network-aware naming
 │
 ├── relayer/                       # Zcash → Starknet header relay service
 │   └── src/
@@ -353,6 +355,14 @@ neo-zarklink/
 │   ├── start-devnet.sh            # Full infrastructure orchestrator (~1400 lines)
 │   ├── deploy.sh                  # Scarb build + deploy wrapper (bash)
 │   ├── deploy.ts                  # TypeScript deployment script (starknet.js)
+│   ├── deploy-sepolia.ts          # Sepolia testnet deployment
+│   ├── create-sepolia-account.ts  # Sepolia account generator
+│   ├── devscript0-setup.ts         # Vault registration + collateral setup (devnet)
+│   ├── devscript1-simulate.ts     # Multi-issue + redeem simulation (devnet)
+│   ├── tntscript0-setup.ts        # Vault setup (testnet — single vault)
+│   ├── tntscript1-simulate.ts     # Issue walkthrough (testnet)
+│   ├── test-functional.ts         # E2E functional test (18 assertions)
+│   ├── push-to-prod.sh            # Production push helper
 │   └── install-deps.sh            # Dependency installer (interactive)
 │
 ├── .devnet/                       # Generated at runtime (gitignored)
@@ -364,6 +374,7 @@ neo-zarklink/
 │
 ├── pnpm-workspace.yaml            # pnpm workspace: frontend, relayer, etc.
 ├── package.json                   # Root workspace config
+├── switch-env.sh                  # Network switcher (devnet ↔ testnet)
 ├── .env.devnet                    # Auto-generated env vars (all services)
 ├── ARCHITECTURE.md                # This file — detailed technical docs
 └── README.md                      # Quick start, usage, troubleshooting
@@ -653,8 +664,9 @@ For example, `0x496e73756666696369656e742062616c616e6365` → "Insufficient bala
 ```
 1. Kill all existing services
 2. Wipe .devnet/ state directory
-3. Start zcashd (regtest) → wait for wallet ready (~80s)
-4. Fund Zcash accounts (mine blocks, create shielded addresses, z_sendmany)
+3. Start zcashd (regtest) → wait for wallet ready (~80-300s on first start)
+4. Fund Zcash accounts (mine 200 blocks, create shielded addrs, z_sendmany
+   with AllowFullyTransparent privacy policy)
 5. Start starknet-devnet-rs → wait for port 5050
 6. Fetch 15 predeployed Starknet accounts
 7. Generate .env.devnet (environment file)
@@ -836,42 +848,70 @@ logic lives.
 │   ├─ DevnetAccount type: { label, address, privateKey, zcashAddr } │
 │   └─ useAccounts() → { accounts, selected, setSelected }           │
 ├─────────────────────────────────────────────────────────────────────┤
-│ context/WalletContext.tsx             ~100 lines                    │
-│   └─ Wallet connection state (devnet mode vs browser extension)     │
+│ context/WalletContext.tsx             ~280 lines                    │
+│   ┌─ Uses starknetkit connect() with modal for wallet discovery     │
+│   ├─ Supports ArgentX, Braavos, MetaMask (via Starknet Snap)       │
+│   ├─ walletKind: "argentX" | "braavos" | "metamask" | "unknown"    │
+│   └─ Dynamic import of starknetkit (SSR-safe)                       │
 ├─────────────────────────────────────────────────────────────────────┤
-│ components/WalletConnector.tsx        ~200 lines                    │
+│ context/ZcashAccountContext.tsx       ~175 lines                    │
+│   ┌─ localStorage-based Zcash↔Starknet address mapping             │
+│   ├─ Per-network storage keys (zarklink-zcash-associations-{net})  │
+│   ├─ CRUD: associate(), removeAssociation(), clearAll()             │
+│   └─ getZcashAddress(starknetAddr) → string | undefined            │
+├─────────────────────────────────────────────────────────────────────┤
+│ context/BridgeContext.tsx             ~115 lines                    │
+│   └─ Persists bridge form state (tab, amount, etc.) across nav     │
+├─────────────────────────────────────────────────────────────────────┤
+│ components/WalletConnector.tsx        ~250 lines                    │
 │   ┌─ Account dropdown (label → role assignment)                     │
+│   ├─ Shows wallet kind label (MetaMask Snap / ArgentX / Braavos)    │
 │   ├─ Always shows: Starknet address, Zcash address (with copy)     │
-│   └─ "More" toggle reveals private key                              │
+│   └─ Uses zcashCoinName() for network-aware coin names              │
 ├─────────────────────────────────────────────────────────────────────┤
 │ app/page.tsx                          Dashboard                     │
 │   Uses useBridgeStats(), useRelayStatus(), usePoolStats()           │
-│   Displays 9 stat cards in 3x3 grid                                │
+│   Dual balance display: ZEC/TAZ + wZEC/wTAZ (for connected wallet) │
+│   Displays 9 stat cards in 3x3 grid. Network-aware coin names.     │
 ├─────────────────────────────────────────────────────────────────────┤
-│ app/bridge/page.tsx                   Issue & Redeem  (~725 lines)  │
-│   Tab-based UI: Issue (ZEC→wZEC) and Redeem (wZEC→ZEC)            │
-│   ┌─ Balance display: wZEC (Starknet) + ZEC (Zcash) side by side  │
-│   ├─ handleIssue: 3-step devnet auto-completion                    │
-│   │  request_lock → submit_mint → confirm_issue (as vault op)      │
+│ app/bridge/page.tsx                   Issue & Redeem (~1084 lines)  │
+│   Tab-based UI: Issue (ZEC/TAZ→wZEC/wTAZ) and Redeem               │
+│   ┌─ Balance display: wZEC/wTAZ (Starknet) + ZEC/TAZ (Zcash)      │
+│   ├─ handleIssue (devnet): request_lock → z_sendmany → submit_mint │
+│   │  → confirm_issue — actually transfers ZEC from issuer to vault  │
+│   ├─ handleIssue (testnet): request_lock → show vault addr + amount │
+│   │  → user manually sends TAZ → clicks "I've Sent" → completeIssue│
 │   ├─ handleRedeem: 2-step devnet auto-completion                   │
-│   │  Pre-validates wZEC balance → submit_burn → confirm_redeem     │
-│   ├─ findFinalizedBlock() — queries relay for finalized block root │
-│   ├─ getVaultOperatorAccount() — devnet accounts[vault_id + 1]     │
-│   ├─ Max button (redeem): fills input with full wZEC balance       │
+│   │  Pre-validates wZEC/wTAZ balance → submit_burn → confirm_redeem│
+│   ├─ getVaultZcashAddress() — reads vault z-addr from VaultRegistry│
+│   ├─ devnetSendZec() — calls /api/dev send_zec action              │
+│   ├─ completeIssue() — shared submit_mint + confirm_issue logic    │
+│   ├─ pendingManualSend state — testnet UI for manual TAZ send      │
+│   ├─ Max button: fills input with full balance                      │
 │   ├─ Step-by-step status messages during multi-step flows          │
 │   └─ Friendly error messages via friendlyTxError()                 │
 ├─────────────────────────────────────────────────────────────────────┤
+│ app/account/page.tsx                  Zcash Account Association     │
+│   ┌─ Associate Zcash addresses with connected Starknet account      │
+│   ├─ Active account banner (Starknet + Zcash addresses)             │
+│   ├─ TAZ faucet links + testnet info panel (conditional)            │
+│   ├─ Association form with address validation                       │
+│   └─ Associations list with active indicator and delete             │
+├─────────────────────────────────────────────────────────────────────┤
 │ app/vaults/page.tsx                   Vault Browser                 │
 │   Table showing all vaults: ID, owner (truncated), status,          │
-│   collateral, issued, redeemed. Uses useVaultList(15000).          │
-│   Filters Active vaults (status===1). Auto-refreshes every 15s.    │
+│   collateral, pool share %, issued, redeemed.                        │
+│   Pool share uses largest-remainder rounding (sum = 100.00%).        │
+│   Uses useVaultList(15000). Filters Active (status===1).             │
+│   Auto-refreshes every 15s.                                          │
 ├─────────────────────────────────────────────────────────────────────┤
 ├─────────────────────────────────────────────────────────────────────┤
 │ app/api/zcash-balance/route.ts        Zcash Balance API             │
-│   Server-side route proxying zcashd z_getbalance / z_gettotalbalance│
-│   Uses ZCASH_RPC_USER/PASS (server-only, NOT NEXT_PUBLIC_)         │
-│   Returns JSON: { balance, address } or { transparent, private }   │
-│   Graceful error handling: returns { balance: "—" } on failure     │
+│   ┌─ Devnet: proxies zcashd z_getbalance / z_gettotalbalance       │
+│   │  Uses ZCASH_RPC_USER/PASS (server-only, NOT NEXT_PUBLIC_)      │
+│   ├─ Testnet: returns "—" for wallet queries (public RPCs can't    │
+│   │  do z_getbalance); supports ?method= for blockchain queries    │
+│   └─ Graceful error handling: returns { balance: "—" } on failure  │
 ├─────────────────────────────────────────────────────────────────────┤
 │ app/relay/page.tsx                    Relay Status                  │
 │   Chain tip, finalized height, header count. Uses useRelayStats().  │
@@ -920,14 +960,72 @@ logic lives.
 └─────────────────────────────────────────────────────────────────────┘
 ```
 
+### 12.15 Zcash v6+ Privacy Policies
+
+Zcash v6 introduced strict privacy policies for `z_sendmany`. When sending from a
+transparent address (t-addr), the transparent change output reveals both the sender
+and recipients. The privacy policy must be explicitly set:
+
+```
+zcash-cli z_sendmany "<from>" '<amounts_json>' <minconf> <fee> <privacyPolicy>
+```
+
+**Policy hierarchy** (most → least private):
+```
+FullPrivacy > AllowRevealedAmounts > AllowRevealedRecipients > AllowRevealedSenders > AllowFullyTransparent > NoPrivacy
+```
+
+- **`start-devnet.sh`** uses `AllowFullyTransparent` for funding shielded addresses
+  from transparent addresses (t-addr → z-addr with transparent change).
+- **`/api/dev` route** uses `NoPrivacy` (even more permissive — acceptable for devnet).
+- `AllowRevealedAmounts` alone is **insufficient** for t-addr → z-addr because it
+  doesn't cover the revealed sender or the transparent change output.
+
+The fee argument must be provided to reach the privacy policy positional argument.
+Use `null` for default ZIP 317 fee calculation.
+
+### 12.16 Pool Share Calculation
+
+The vaults page displays each vault's share of the total collateral pool as a
+percentage. To ensure percentages always sum to exactly 100.00%, the frontend uses
+**largest-remainder rounding** (Hamilton's method):
+
+1. Compute raw share: `vault_collateral / total_collateral * 100`
+2. Take floor of each share to 2 decimal places
+3. Compute remainder for each vault
+4. Distribute leftover 0.01% increments to vaults with the largest remainders
+
+This replaces the previous collateral-to-obligation ratio display, which showed
+values > 100% and was not meaningful for pool accounting.
+
+### 12.17 Deployer Key Security
+
+The deployer private key must **never** be exposed as a `NEXT_PUBLIC_` variable in
+testnet/production environments (it would be visible in client-side JavaScript).
+
+- **Devnet**: `NEXT_PUBLIC_DEPLOYER_KEY` is acceptable because all devnet keys are
+  already exposed via `NEXT_PUBLIC_DEVNET_ACCOUNTS` (throwaway keys from starknet-devnet).
+- **Testnet/Production**: `deploy-sepolia.ts` writes `DEPLOYER_KEY` (server-only)
+  to `frontend/.env.testnet`. The frontend's `getDevnetAccount()` checks both
+  variable names for backwards compatibility.
+```
+
 ### Scripts (`scripts/`)
 
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
 │ start-devnet.sh                       ~1400 lines                   │
 │   ┌─ Configuration: NUM_VAULTS, ports, paths, colors                │
-│   ├─ start_zcashd()       — zcashd -regtest, wait for wallet       │
-│   ├─ fund_zcash()         — mine blocks, create shielded addrs     │
+│   ├─ zcash_rpc()       — RPC helper (stderr visible for debugging) │
+│   ├─ zcash_rpc_quiet() — RPC helper (stderr suppressed for polling)│
+│   ├─ ZCASH_RPC_PASS    — reuses password from existing zcash.conf  │
+│   ├─ ZCASH_INITIAL_BLOCKS=200 — ensures sufficient mature coinbase │
+│   ├─ start_zcashd()       — zcashd -regtest, wait for wallet (420s) │
+│   ├─ fund_zcash()         — mine blocks, create shielded addrs,    │
+│   │                         z_sendmany with AllowFullyTransparent   │
+│   │                         privacy policy (required for zcashd v6+)│
+│   ├─ stop_zcash()         — polls for process exit (30s timeout),  │
+│   │                         force-kills if needed                   │
 │   ├─ start_starknet()     — starknet-devnet --seed 42              │
 │   ├─ fetch_accounts()     — GET /predeployed_accounts, label them   │
 │   ├─ generate_env()       — write .env.devnet                       │
@@ -962,6 +1060,44 @@ logic lives.
 │ install-deps.sh                       ~100 lines                    │
 │   Checks Node.js, pnpm/npm, Scarb, snforge, zcashd                │
 │   Prompts for pnpm vs npm, runs install                             │
+├─────────────────────────────────────────────────────────────────────┤
+│ devscript0-setup.ts                   ~200 lines                    │
+│   Registers 8 vault operators with graduated collateral tiers.      │
+│   Deposits to both VaultRegistry and VaultPool.                     │
+│   Displays pool share % using largest-remainder rounding (=100.00%).│
+│   Uses Math.round() for zatoshi conversion (avoids float errors).   │
+├─────────────────────────────────────────────────────────────────────┤
+│ devscript1-simulate.ts                ~250 lines                    │
+│   Multi-step bridge simulation: N issues + 1 redeem.                │
+│   Advances relay headers between steps. Uses last vault (derived    │
+│   from NUM_VAULTS, not hardcoded). Math.round() for zatoshi.        │
+├─────────────────────────────────────────────────────────────────────┤
+│ tntscript0-setup.ts                   ~150 lines                    │
+│   Testnet vault setup. Registers deployer as single vault operator  │
+│   on Starknet Sepolia. Mints wZEC collateral, deposits to registry  │
+│   and pool. Reads from .env.sepolia + .sepolia/deployments.json.    │
+├─────────────────────────────────────────────────────────────────────┤
+│ tntscript1-simulate.ts                ~180 lines                    │
+│   Testnet issue walkthrough. Single request_lock + submit_mint +    │
+│   confirm_issue cycle using deployer vault. Advances relay with     │
+│   Zcash testnet headers if RPC available.        │
+├─────────────────────────────────────────────────────────────────────┤
+│ deploy-sepolia.ts                     ~300 lines                    │
+│   Deploys all 6 contracts to Starknet Sepolia testnet.              │
+│   Auto-loads .env.sepolia without dotenv dependency.                │
+│   Writes DEPLOYER_KEY (server-only, NOT NEXT_PUBLIC_) to env files. │
+├─────────────────────────────────────────────────────────────────────┤
+│ create-sepolia-account.ts             ~100 lines                    │
+│   Generates Starknet account for Sepolia. Saves to .sepolia/.       │
+│   --deploy flag deploys the account contract on-chain.              │
+├─────────────────────────────────────────────────────────────────────┤
+│ test-functional.ts                    ~300 lines                    │
+│   End-to-end functional test (18 assertions across 8 sections).     │
+│   Tests: contract reads, vault registration, relay seeding,         │
+│   full issue flow, full redeem flow, vault tracking, pool stats.    │
+├─────────────────────────────────────────────────────────────────────┤
+│ push-to-prod.sh                       ~50 lines                     │
+│   Helper script for pushing to production deployment.               │
 └─────────────────────────────────────────────────────────────────────┘
 ```
 

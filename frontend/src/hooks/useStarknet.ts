@@ -146,6 +146,7 @@ export function useRelayStats(refreshMs = 10000) {
 export interface PoolStats {
   poolSize: number;
   capacity: bigint;
+  totalDeposited: bigint;
 }
 
 export function usePoolStats(refreshMs = 0) {
@@ -157,13 +158,15 @@ export function usePoolStats(refreshMs = 0) {
       const provider = getProvider();
       if (!starknetConfig.poolAddress) return;
       const pool = new Contract({ abi: POOL_ABI, address: starknetConfig.poolAddress, providerOrAccount: provider });
-      const [size, cap] = await Promise.all([
+      const [size, cap, deposited] = await Promise.all([
         pool.call("get_active_vault_count", []),
         pool.call("get_pool_capacity", []),
+        pool.call("get_total_deposited", []),
       ]);
       setStats({
         poolSize: Number(size),
         capacity: BigInt(String(cap ?? 0)),
+        totalDeposited: BigInt(String(deposited ?? 0)),
       });
     } catch {
       // Not deployed
@@ -191,7 +194,8 @@ export interface VaultInfo {
   collateral: bigint;
   status: number;
   zcashAddress: string;
-  collateralRatio: number;
+  /** Pool share: this vault's collateral as a percentage of total collateral (0-100, 2 decimal precision) */
+  poolShare: number;
   totalIssued: bigint;
   totalRedeemed: bigint;
 }
@@ -216,20 +220,54 @@ export function useVaultList(refreshMs = 0) {
         try {
           // eslint-disable-next-line @typescript-eslint/no-explicit-any
           const info: any = await registry.call("get_vault", [i]);
+          const collateral = BigInt(String(info[3] ?? 0));
+          const totalIssued = BigInt(String(info[8] ?? 0));
+          const totalRedeemed = BigInt(String(info[9] ?? 0));
+          
           list.push({
             id: i + 1, // Display as 1-based (on-chain vault_id is 0-based)
             owner: String(info[0] ?? ""),
-            collateral: BigInt(String(info[3] ?? 0)),
+            collateral,
             status: Number(info[4] ?? 0),
             zcashAddress: String(info[1] ?? ""),
-            collateralRatio: 0, // Not directly stored; computed from registry params
-            totalIssued: BigInt(String(info[8] ?? 0)),
-            totalRedeemed: BigInt(String(info[9] ?? 0)),
+            poolShare: 0, // Computed below after all vaults are loaded
+            totalIssued,
+            totalRedeemed,
           });
         } catch {
           // Skip errored vaults
         }
       }
+
+      // Compute pool share percentages: each vault's collateral / total collateral * 100
+      // Uses precise rounding so that all percentages sum to exactly 100.00%
+      const totalCollateral = list.reduce((sum, v) => sum + v.collateral, 0n);
+      if (totalCollateral > 0n) {
+        // Step 1: Compute raw percentages
+        const rawShares = list.map(v => 
+          Number(v.collateral) / Number(totalCollateral) * 100
+        );
+        // Step 2: Floor to 2 decimals, track remainders
+        const floored = rawShares.map(s => Math.floor(s * 100) / 100);
+        const remainders = rawShares.map((s, i) => ({
+          index: i,
+          remainder: s - floored[i],
+        }));
+        // Step 3: Distribute the rounding gap to reach exactly 100.00%
+        const flooredSum = floored.reduce((a, b) => a + b, 0);
+        // Gap in units of 0.01 (cents of a percent)
+        let gap = Math.round((100 - flooredSum) * 100);
+        // Sort by largest remainder first — give extra 0.01% to those
+        remainders.sort((a, b) => b.remainder - a.remainder);
+        for (const r of remainders) {
+          if (gap <= 0) break;
+          floored[r.index] = Math.round((floored[r.index] + 0.01) * 100) / 100;
+          gap--;
+        }
+        // Step 4: Assign final percentages
+        list.forEach((v, i) => { v.poolShare = floored[i]; });
+      }
+
       setVaults(list);
     } catch {
       // Not deployed

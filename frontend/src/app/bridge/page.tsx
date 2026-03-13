@@ -13,22 +13,30 @@ import {
   Check,
   Wallet,
   RefreshCw,
+  Send,
 } from "lucide-react";
 import { CallData, Contract, Account } from "starknet";
 import { useBridgeStats, usePoolStats, useWzecBalance, useZcashBalance } from "@/hooks/useStarknet";
 import { useAccount } from "@/context/AccountContext";
 import { useWallet } from "@/context/WalletContext";
+import { useZcashAccount } from "@/context/ZcashAccountContext";
+import { useBridge } from "@/context/BridgeContext";
 import {
   config as starknetConfig,
   formatZec,
+  formatWrappedZec,
   shortAddr,
   friendlyTxError,
   getProvider,
+  isDevnet,
+  isTestnet,
+  explorerUrl,
+  zcashCoinName,
+  wrappedCoinName,
   BRIDGE_ABI,
   RELAY_ABI,
+  REGISTRY_ABI,
 } from "@/lib/starknet";
-
-type Tab = "issue" | "redeem";
 
 // ── Clipboard copy button ────────────────────────────────────────────────────
 
@@ -104,54 +112,209 @@ function getVaultOperatorAccount(
   });
 }
 
+/**
+ * Fetch the Zcash address for a vault from the on-chain VaultRegistry.
+ */
+async function getVaultZcashAddress(vaultId: number): Promise<string | null> {
+  if (!starknetConfig.registryAddress) return null;
+  const provider = getProvider();
+  const registry = new Contract({
+    abi: REGISTRY_ABI,
+    address: starknetConfig.registryAddress,
+    providerOrAccount: provider,
+  });
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const info: any = await registry.call("get_vault", [vaultId]);
+    const addr = String(info[1] ?? "");
+    return addr && addr !== "0" && addr !== "0x0" ? addr : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Devnet: send ZEC from one address to another via the dev API, mine blocks, wait for completion.
+ * Returns the operation ID on success, or throws on failure.
+ */
+async function devnetSendZec(
+  fromAddress: string,
+  toAddress: string,
+  amount: number,
+  setStatusMsg: (msg: string) => void,
+): Promise<string> {
+  // 1. Send ZEC
+  setStatusMsg(`Sending ${amount.toFixed(8)} ${zcashCoinName()} to vault...`);
+  const sendRes = await fetch("/api/dev", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ action: "send_zec", from_address: fromAddress, to_address: toAddress, amount: String(amount) }),
+  });
+  const sendData = await sendRes.json();
+  if (!sendData.ok) throw new Error(`ZEC send failed: ${sendData.error}`);
+  const opid = sendData.operation_id;
+
+  // 2. Mine a block so the transaction confirms
+  setStatusMsg("Mining block to confirm ZEC transfer...");
+  await fetch("/api/dev", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ action: "mine_blocks", count: 1 }),
+  });
+
+  // 3. Poll operation status (up to 30s)
+  for (let i = 0; i < 30; i++) {
+    await new Promise((r) => setTimeout(r, 1000));
+    const statusRes = await fetch("/api/dev", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ action: "check_operation", opid }),
+    });
+    const statusData = await statusRes.json();
+    if (statusData.ok && Array.isArray(statusData.status) && statusData.status.length > 0) {
+      const op = statusData.status[0];
+      if (op.status === "success") return opid;
+      if (op.status === "failed") throw new Error(`ZEC send failed: ${op.error?.message ?? "unknown"}`);
+    }
+    // Mine another block if still executing
+    if (i % 3 === 2) {
+      await fetch("/api/dev", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ action: "mine_blocks", count: 1 }),
+      });
+    }
+  }
+  throw new Error("ZEC send timed out after 30s");
+}
+
 // ── Bridge Page ──────────────────────────────────────────────────────────────
 
 export default function BridgePage() {
-  const [tab, setTab] = useState<Tab>("issue");
-  const [amount, setAmount] = useState("");
-  const [splits, setSplits] = useState("16");
-  const [zcashAddress, setZcashAddress] = useState("");
-  const [submitting, setSubmitting] = useState(false);
-  const [statusMsg, setStatusMsg] = useState("");
-  const [result, setResult] = useState<{
-    type: "success" | "error" | "info";
-    txHash?: string;
-    lines: string[];
-  } | null>(null);
+  // Use global bridge state for persistence across page navigation
+  const {
+    tab, setTab,
+    amount, setAmount,
+    splits, setSplits,
+    zcashAddress, setZcashAddress,
+    submitting, setSubmitting,
+    statusMsg, setStatusMsg,
+    result, setResult,
+  } = useBridge();
 
   const { stats: bridge } = useBridgeStats();
   const { stats: pool } = usePoolStats(10000);
   const { current: account, accounts, getAccount } = useAccount();
   const wallet = useWallet();
+  const { getZcashAddress } = useZcashAccount();
 
-  // Balances with auto-refresh
-  const { balance: wzecBalance, refetch: refetchWzec } = useWzecBalance(account?.address ?? "", 8000);
-  const { balance: zcashBal } = useZcashBalance(account?.zcash_shielded ?? "", 15000);
+  // Balances with auto-refresh (use wallet address if browser-connected)
+  const activeAddress = wallet.address ?? account?.address ?? "";
+  const associatedZcash = activeAddress ? getZcashAddress(activeAddress) : null;
+  const { balance: wzecBalance, refetch: refetchWzec } = useWzecBalance(activeAddress, 8000);
+  const { balance: zcashBal } = useZcashBalance(
+    isDevnet ? (account?.zcash_shielded ?? "") : (associatedZcash ?? ""),
+    isDevnet ? 15000 : 0,
+  );
 
   const zatoshi = Math.floor(parseFloat(amount || "0") * 1e8);
   const fee = bridge ? (zatoshi * bridge.feeRate) / 10000 : 0;
   const receiveAmount = zatoshi - fee;
 
-  // Auto-fill zcash address from account's mapped address
-  const accountZcash = account?.zcash_shielded ?? "";
+  // Zcash address: devnet uses mapped address, testnet uses association
+  const accountZcash = account?.zcash_shielded ?? associatedZcash ?? "";
 
-  // ── Issue (ZEC → wZEC) with devnet auto-completion ───────────────────────
+  // ── Testnet manual send state ──────────────────────────────────────────
+  // When issuing on testnet, the user must manually send TAZ to the vault.
+  // We pause after request_lock and show the vault address/amount.
+  const [pendingManualSend, setPendingManualSend] = useState<{
+    requestId: string;
+    vaultId: number;
+    vaultZcashAddr: string;
+    amountZec: number;
+    lockTxHash: string;
+  } | null>(null);
+
+  // ── Issue (ZEC → wZEC) with real ZEC transfer ────────────────────────────
 
   async function handleIssue() {
     const signer = wallet.getSigner() ?? getAccount();
     if (!signer) {
-      setResult({ type: "error", lines: ["No wallet connected. Select a devnet account or connect a browser wallet."] });
+      setResult({ type: "error", lines: ["No wallet connected. Connect your wallet from the navbar."] });
       return;
     }
     if (!starknetConfig.bridgeAddress) {
-      setResult({ type: "error", lines: ["Bridge contract not deployed. Run: ./scripts/start-devnet.sh --deploy"] });
+      setResult({ type: "error", lines: ["Bridge contract not configured. Check environment setup."] });
+      return;
+    }
+
+    // Validate against pool capacity to prevent unlimited minting
+    if (pool && BigInt(zatoshi) > pool.capacity) {
+      setResult({
+        type: "error",
+        lines: [
+          `Issue amount exceeds pool capacity.`,
+          `Requested: ${formatZec(BigInt(zatoshi))}`,
+          `Available capacity: ${formatZec(pool.capacity)}`,
+          ``,
+          `The pool capacity is based on total vault collateral.`,
+          `Try a smaller amount or wait for more vaults to join.`,
+        ],
+      });
+      return;
+    }
+
+    // Validate ZEC balance (devnet only — testnet balance is "—")
+    if (zcashBal && zcashBal !== "—") {
+      const zcashBalance = parseFloat(zcashBal);
+      const requestedZec = parseFloat(amount || "0");
+      if (!isNaN(zcashBalance) && !isNaN(requestedZec) && zcashBalance < requestedZec) {
+        setResult({
+          type: "error",
+          lines: [
+            `Insufficient ${zcashCoinName()} balance.`,
+            `Your balance: ${zcashBalance.toFixed(8)} ${zcashCoinName()}`,
+            `Required: ${requestedZec.toFixed(8)} ${zcashCoinName()}`,
+            ``,
+            `You need ${zcashCoinName()} in your Zcash shielded address to issue ${wrappedCoinName()}.`,
+            `Current account: ${account?.label ?? "Unknown"} (${shortAddr(account?.address ?? "")})`,
+          ],
+        });
+        return;
+      }
+    }
+
+    // On testnet, require a Zcash address association
+    if (isTestnet && !accountZcash) {
+      setResult({
+        type: "error",
+        lines: [
+          `No ${zcashCoinName()} address associated with this account.`,
+          ``,
+          `Go to the Account page to associate your Zcash testnet address first.`,
+          `You need a funded ${zcashCoinName()} address to send to the vault.`,
+        ],
+      });
+      return;
+    }
+
+    // On devnet, require a mapped Zcash address (pre-funded accounts)
+    if (isDevnet && !accountZcash) {
+      setResult({
+        type: "error",
+        lines: [
+          `No Zcash shielded address linked to this account.`,
+          ``,
+          `To issue ${wrappedCoinName()}, use the pre-funded accounts (Issuer/Redeemer) from the account selector.`,
+        ],
+      });
       return;
     }
 
     const warranty = bridge?.warrantyAmount ?? BigInt(10000000);
 
-    // Step 1: request_lock
-    setStatusMsg("Step 1/3: Requesting lock permit...");
+    // Step 1: request_lock on Starknet
+    setStatusMsg("Step 1: Requesting lock permit on Starknet...");
     const txResult = await signer.execute({
       contractAddress: starknetConfig.bridgeAddress,
       entrypoint: "request_lock",
@@ -163,7 +326,6 @@ export default function BridgePage() {
     await signer.waitForTransaction(txResult.transaction_hash);
 
     // Read request_id from TX events
-    setStatusMsg("Step 2/3: Submitting mint proof (devnet auto-complete)...");
     const provider = getProvider();
     const receipt = await provider.getTransactionReceipt(txResult.transaction_hash);
     let requestId = "0x0";
@@ -178,20 +340,19 @@ export default function BridgePage() {
       }
     }
 
-    const issueCount = await (async () => {
-      try {
-        const bc = new Contract({ abi: BRIDGE_ABI, address: starknetConfig.bridgeAddress, providerOrAccount: provider });
-        return Number(await bc.call("get_issue_count", []));
-      } catch { return 0; }
-    })();
-
     if (requestId === "0x0") {
+      const issueCount = await (async () => {
+        try {
+          const bc = new Contract({ abi: BRIDGE_ABI, address: starknetConfig.bridgeAddress, providerOrAccount: provider });
+          return Number(await bc.call("get_issue_count", []));
+        } catch { return 0; }
+      })();
       setResult({
         type: "info",
         txHash: txResult.transaction_hash,
         lines: [
-          `Issue request submitted (Step 1 of 3 complete)!`,
-          `Amount: ${formatZec(BigInt(zatoshi))} → Receive: ~${formatZec(BigInt(Math.floor(receiveAmount)))} wZEC`,
+          `Issue request submitted (Step 1 complete)!`,
+          `Amount: ${formatZec(BigInt(zatoshi))} → Receive: ~${formatWrappedZec(BigInt(Math.floor(receiveAmount)))}`,
           `Issue count: ${issueCount}`,
           ``,
           `Could not auto-complete: request_id not found in TX events.`,
@@ -207,18 +368,103 @@ export default function BridgePage() {
     const reqData: any = await bridgeContract.call("get_issue_request", [requestId]);
     const vaultId = Number(reqData[2] ?? 0);
 
-    // Find a finalized block for submit_mint
-    const finalized = await findFinalizedBlock();
-    if (!finalized) {
+    // Look up vault's Zcash address from the registry
+    const vaultZcashAddr = await getVaultZcashAddress(vaultId);
+
+    // ── Testnet: manual send flow ──────────────────────────────────────
+    if (isTestnet) {
+      if (!vaultZcashAddr) {
+        setResult({
+          type: "info",
+          txHash: txResult.transaction_hash,
+          lines: [
+            `Issue request submitted! Assigned to Vault #${vaultId + 1}`,
+            `Request ID: ${requestId.slice(0, 18)}...`,
+            ``,
+            `Could not look up vault's Zcash address.`,
+            `Ask the vault operator for their address to complete the transfer.`,
+          ],
+        });
+        return;
+      }
+
+      // Pause and show manual send instructions
+      const amountZec = parseFloat(amount || "0");
+      setPendingManualSend({
+        requestId,
+        vaultId,
+        vaultZcashAddr,
+        amountZec,
+        lockTxHash: txResult.transaction_hash,
+      });
       setResult({
         type: "info",
         txHash: txResult.transaction_hash,
         lines: [
-          `Issue request submitted (Step 1 of 3 complete)!`,
+          `Lock request submitted! Now send ${zcashCoinName()} to the vault.`,
+          ``,
+          `Send exactly ${amountZec.toFixed(8)} ${zcashCoinName()} to:`,
+          vaultZcashAddr,
+          ``,
+          `Vault: #${vaultId + 1}`,
+          `After sending, click "I've Sent the ${zcashCoinName()}" below to complete the issue.`,
+        ],
+      });
+      setSubmitting(false);
+      return;
+    }
+
+    // ── Devnet: automatic ZEC transfer ─────────────────────────────────
+    if (isDevnet && vaultZcashAddr && accountZcash) {
+      const sendAmount = parseFloat(amount || "0");
+      try {
+        await devnetSendZec(accountZcash, vaultZcashAddr, sendAmount, setStatusMsg);
+      } catch (err) {
+        setResult({
+          type: "info",
+          txHash: txResult.transaction_hash,
+          lines: [
+            `Lock request submitted, but ZEC transfer failed:`,
+            err instanceof Error ? err.message : "Unknown error",
+            ``,
+            `Request ID: ${requestId.slice(0, 18)}...`,
+            `Vault: #${vaultId + 1} (${vaultZcashAddr.slice(0, 16)}...)`,
+            ``,
+            `You can retry or the vault daemon will handle this.`,
+          ],
+        });
+        return;
+      }
+    }
+
+    // ── Steps 2-3: submit_mint + confirm_issue (same for devnet) ───────
+    await completeIssue(signer, provider, requestId, vaultId, txResult.transaction_hash);
+  }
+
+  /**
+   * Complete the issue flow: submit_mint + confirm_issue.
+   * Called automatically on devnet, or after user confirms manual send on testnet.
+   */
+  async function completeIssue(
+    signer: Account,
+    provider: ReturnType<typeof getProvider>,
+    requestId: string,
+    vaultId: number,
+    lockTxHash: string,
+  ) {
+    // Find a finalized block for submit_mint
+    setStatusMsg("Finding finalized block for mint proof...");
+    const finalized = await findFinalizedBlock();
+    if (!finalized) {
+      setResult({
+        type: "info",
+        txHash: lockTxHash,
+        lines: [
+          `Issue request submitted (Step 1 complete)!`,
           `Request ID: ${requestId.slice(0, 18)}...`,
           `Assigned Vault: #${vaultId + 1}`,
           ``,
-          `No finalized blocks in relay — cannot auto-complete submit_mint.`,
+          `No finalized blocks in relay — cannot submit mint proof.`,
           `Start the relayer service to relay Zcash headers.`,
         ],
       });
@@ -226,8 +472,9 @@ export default function BridgePage() {
     }
 
     // Step 2: submit_mint as the issuer
+    setStatusMsg("Submitting mint proof...");
     const submitMintTx = await signer.execute({
-      contractAddress: starknetConfig.bridgeAddress,
+      contractAddress: starknetConfig.bridgeAddress!,
       entrypoint: "submit_mint",
       calldata: CallData.compile({
         request_id: requestId,
@@ -241,7 +488,7 @@ export default function BridgePage() {
     await signer.waitForTransaction(submitMintTx.transaction_hash);
 
     // Step 3: confirm_issue as the vault operator
-    setStatusMsg("Step 3/3: Vault confirming issue (minting wZEC)...");
+    setStatusMsg(`Vault confirming issue (minting ${wrappedCoinName()})...`);
     const vaultOperator = getVaultOperatorAccount(vaultId, accounts);
     if (!vaultOperator) {
       setResult({
@@ -260,7 +507,7 @@ export default function BridgePage() {
     }
 
     const confirmTx = await vaultOperator.execute({
-      contractAddress: starknetConfig.bridgeAddress,
+      contractAddress: starknetConfig.bridgeAddress!,
       entrypoint: "confirm_issue",
       calldata: CallData.compile({ request_id: requestId }),
     });
@@ -275,16 +522,54 @@ export default function BridgePage() {
       txHash: confirmTx.transaction_hash,
       lines: [
         `Issue complete!`,
-        `Amount: ${formatZec(BigInt(zatoshi))} ZEC → ${formatZec(minted)} wZEC minted`,
+        `Amount: ${formatZec(BigInt(zatoshi))} → ${formatWrappedZec(minted)} minted`,
         `Fee: ${formatZec(feeAmount)} (${bridge ? (bridge.feeRate / 100).toFixed(2) : "?"}%)`,
         `Vault: #${vaultId + 1}`,
         ``,
-        `All 3 steps completed automatically (devnet mode):`,
-        `• Step 1: Lock request → TX: ${shortAddr(txResult.transaction_hash, 8)}`,
-        `• Step 2: Mint proof submitted → TX: ${shortAddr(submitMintTx.transaction_hash, 8)}`,
-        `• Step 3: Vault confirmed → TX: ${shortAddr(confirmTx.transaction_hash, 8)}`,
+        `All steps completed${isDevnet ? ' automatically (devnet mode)' : ''}:`,
+        `• Lock request → TX: ${shortAddr(lockTxHash, 8)}`,
+        isDevnet ? `• ${zcashCoinName()} transferred to vault` : `• ${zcashCoinName()} sent manually to vault`,
+        `• Mint proof submitted → TX: ${shortAddr(submitMintTx.transaction_hash, 8)}`,
+        `• Vault confirmed → TX: ${shortAddr(confirmTx.transaction_hash, 8)}`,
       ],
     });
+    setPendingManualSend(null);
+  }
+
+  /**
+   * Testnet: user confirms they've sent the TAZ manually.
+   * Resume the issue flow with submit_mint + confirm_issue.
+   */
+  async function handleConfirmManualSend() {
+    if (!pendingManualSend) return;
+
+    const signer = wallet.getSigner() ?? getAccount();
+    if (!signer) {
+      setResult({ type: "error", lines: ["Wallet disconnected. Reconnect and try again."] });
+      return;
+    }
+
+    setSubmitting(true);
+    setResult(null);
+    setStatusMsg("Continuing issue after manual send...");
+
+    try {
+      const provider = getProvider();
+      await completeIssue(
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        signer as any,
+        provider,
+        pendingManualSend.requestId,
+        pendingManualSend.vaultId,
+        pendingManualSend.lockTxHash,
+      );
+    } catch (err) {
+      const { message, hints } = friendlyTxError(err);
+      setResult({ type: "error", lines: [message, ...hints] });
+    } finally {
+      setSubmitting(false);
+      setStatusMsg("");
+    }
   }
 
   // ── Redeem (wZEC → ZEC) with devnet auto-completion ──────────────────────
@@ -292,11 +577,11 @@ export default function BridgePage() {
   async function handleRedeem() {
     const signer = wallet.getSigner() ?? getAccount();
     if (!signer) {
-      setResult({ type: "error", lines: ["No wallet connected. Select a devnet account or connect a browser wallet."] });
+      setResult({ type: "error", lines: ["No wallet connected. Connect your wallet from the navbar."] });
       return;
     }
     if (!starknetConfig.bridgeAddress) {
-      setResult({ type: "error", lines: ["Bridge contract not deployed. Run: ./scripts/start-devnet.sh --deploy"] });
+      setResult({ type: "error", lines: ["Bridge contract not configured. Check environment setup."] });
       return;
     }
 
@@ -305,11 +590,11 @@ export default function BridgePage() {
       setResult({
         type: "error",
         lines: [
-          `Insufficient wZEC balance.`,
-          `Your balance: ${formatZec(wzecBalance)}`,
-          `Required: ${formatZec(BigInt(zatoshi))}`,
+          `Insufficient ${wrappedCoinName()} balance.`,
+          `Your balance: ${formatWrappedZec(wzecBalance)}`,
+          `Required: ${formatWrappedZec(BigInt(zatoshi))}`,
           ``,
-          `Make sure you're using the account that received wZEC from an Issue.`,
+          `Make sure you're using the account that received ${wrappedCoinName()} from an Issue.`,
           `Current account: ${account?.label ?? "Unknown"} (${shortAddr(account?.address ?? "")})`,
         ],
       });
@@ -324,7 +609,7 @@ export default function BridgePage() {
     const noteCiphertextHash = "0x" + BigInt(Date.now() + 1).toString(16);
 
     // Step 1: submit_burn (burns wZEC from caller)
-    setStatusMsg("Step 1/2: Burning wZEC...");
+    setStatusMsg(`Step 1/2: Burning ${wrappedCoinName()}...`);
     const txResult = await signer.execute({
       contractAddress: starknetConfig.bridgeAddress,
       entrypoint: "submit_burn",
@@ -362,8 +647,8 @@ export default function BridgePage() {
         type: "info",
         txHash: txResult.transaction_hash,
         lines: [
-          `Redeem Step 1 complete — wZEC burned!`,
-          `Burn amount: ${formatZec(BigInt(zatoshi))}`,
+          `Redeem Step 1 complete — ${wrappedCoinName()} burned!`,
+          `Burn amount: ${formatWrappedZec(BigInt(zatoshi))}`,
           `Destination: ${dest}`,
           ``,
           requestId === "0x0"
@@ -388,8 +673,8 @@ export default function BridgePage() {
         type: "info",
         txHash: txResult.transaction_hash,
         lines: [
-          `Redeem Step 1 complete — wZEC burned!`,
-          `Burn amount: ${formatZec(BigInt(zatoshi))}`,
+          `Redeem Step 1 complete — ${wrappedCoinName()} burned!`,
+          `Burn amount: ${formatWrappedZec(BigInt(zatoshi))}`,
           `Destination: ${dest}`,
           `Assigned Vault: #${vaultId + 1}`,
           ``,
@@ -415,12 +700,12 @@ export default function BridgePage() {
       txHash: confirmTx.transaction_hash,
       lines: [
         `Redeem complete!`,
-        `Burned: ${formatZec(BigInt(zatoshi))} wZEC`,
+        `Burned: ${formatWrappedZec(BigInt(zatoshi))}`,
         `Destination: ${dest}`,
         `Vault: #${vaultId + 1}`,
         ``,
-        `All steps completed automatically (devnet mode):`,
-        `• Step 1: wZEC burned → TX: ${shortAddr(txResult.transaction_hash, 8)}`,
+        `All steps completed automatically${isDevnet ? ' (devnet mode)' : ''}:`,
+        `• Step 1: ${wrappedCoinName()} burned → TX: ${shortAddr(txResult.transaction_hash, 8)}`,
         `• Step 2: Vault confirmed → TX: ${shortAddr(confirmTx.transaction_hash, 8)}`,
       ],
     });
@@ -481,15 +766,15 @@ export default function BridgePage() {
             </div>
             <div className="grid grid-cols-2 gap-4">
               <div className="bg-brand-dark rounded-lg p-3 border border-brand-border">
-                <p className="text-xs text-gray-400 mb-1">wZEC Balance (Starknet)</p>
+                <p className="text-xs text-gray-400 mb-1">{wrappedCoinName()} Balance (Starknet)</p>
                 <p className="text-lg font-bold font-mono text-brand-primary">
-                  {formatZec(wzecBalance)}
+                  {formatWrappedZec(wzecBalance)}
                 </p>
               </div>
               <div className="bg-brand-dark rounded-lg p-3 border border-brand-border">
-                <p className="text-xs text-gray-400 mb-1">ZEC Balance (Zcash)</p>
+                <p className="text-xs text-gray-400 mb-1">{zcashCoinName()} Balance (Zcash)</p>
                 <p className="text-lg font-bold font-mono text-brand-blue">
-                  {zcashBal === "—" ? "—" : `${parseFloat(zcashBal).toFixed(8)} ZEC`}
+                  {zcashBal === "—" ? "—" : `${parseFloat(zcashBal).toFixed(8)} ${zcashCoinName()}`}
                 </p>
                 {!accountZcash && (
                   <p className="text-[10px] text-gray-500 mt-0.5">No Zcash address mapped</p>
@@ -510,7 +795,7 @@ export default function BridgePage() {
             }`}
           >
             <Zap className="h-4 w-4" />
-            Issue (ZEC → wZEC)
+            Issue ({zcashCoinName()} → {wrappedCoinName()})
           </button>
           <button
             onClick={() => { setTab("redeem"); setResult(null); }}
@@ -521,7 +806,7 @@ export default function BridgePage() {
             }`}
           >
             <ArrowLeftRight className="h-4 w-4" />
-            Redeem (wZEC → ZEC)
+            Redeem ({wrappedCoinName()} → {zcashCoinName()})
           </button>
         </div>
 
@@ -538,12 +823,21 @@ export default function BridgePage() {
                     onClick={() => setAmount((Number(wzecBalance) / 1e8).toFixed(8))}
                     className="text-xs text-brand-blue hover:text-brand-blue/80 transition-colors"
                   >
-                    Max: {formatZec(wzecBalance)}
+                    Max: {formatWrappedZec(wzecBalance)}
                   </button>
                 )}
                 {tab === "issue" && pool && (
-                  <span className="text-xs">
-                    Pool: {formatZec(pool.capacity)}
+                  <span className="text-xs flex items-center gap-2">
+                    {zcashBal && zcashBal !== "—" && parseFloat(zcashBal) > 0 && (
+                      <button
+                        type="button"
+                        onClick={() => setAmount(parseFloat(zcashBal).toFixed(8))}
+                        className="text-brand-primary hover:text-brand-primary/80 transition-colors"
+                      >
+                        Max: {parseFloat(zcashBal).toFixed(4)} {zcashCoinName()}
+                      </button>
+                    )}
+                    <span className="text-gray-400">Pool: {formatZec(pool.capacity)}</span>
                   </span>
                 )}
               </label>
@@ -558,14 +852,28 @@ export default function BridgePage() {
                   className="input-field flex-1 text-xl font-mono"
                 />
                 <span className="text-sm font-medium text-brand-primary px-3 py-2 bg-brand-primary/10 rounded-lg border border-brand-primary/20">
-                  {tab === "issue" ? "ZEC" : "wZEC"}
+                  {tab === "issue" ? zcashCoinName() : wrappedCoinName()}
                 </span>
               </div>
-              {/* Balance warning for redeem */}
-              {tab === "redeem" && zatoshi > 0 && wzecBalance < BigInt(zatoshi) && (
+              {/* Balance warning for redeem - don't show during transaction */}
+              {tab === "redeem" && zatoshi > 0 && !submitting && wzecBalance < BigInt(zatoshi) && (
                 <p className="text-xs text-red-400 mt-1 flex items-center gap-1">
                   <AlertTriangle className="h-3 w-3" />
-                  Insufficient wZEC balance ({formatZec(wzecBalance)} available)
+                  Insufficient {wrappedCoinName()} balance ({formatWrappedZec(wzecBalance)} available)
+                </p>
+              )}
+              {/* Capacity warning for issue - don't show during transaction */}
+              {tab === "issue" && zatoshi > 0 && !submitting && pool && BigInt(zatoshi) > pool.capacity && (
+                <p className="text-xs text-red-400 mt-1 flex items-center gap-1">
+                  <AlertTriangle className="h-3 w-3" />
+                  Exceeds pool capacity ({formatZec(pool.capacity)} available)
+                </p>
+              )}
+              {/* ZEC balance warning for issue - don't show during transaction */}
+              {tab === "issue" && zatoshi > 0 && !submitting && zcashBal && zcashBal !== "—" && parseFloat(amount || "0") > parseFloat(zcashBal) && (
+                <p className="text-xs text-red-400 mt-1 flex items-center gap-1">
+                  <AlertTriangle className="h-3 w-3" />
+                  Insufficient {zcashCoinName()} balance ({parseFloat(zcashBal).toFixed(8)} {zcashCoinName()} available)
                 </p>
               )}
             </div>
@@ -589,7 +897,7 @@ export default function BridgePage() {
                     : "0.00000000"}
                 </div>
                 <span className="text-sm font-medium text-brand-blue px-3 py-2 bg-brand-blue/10 rounded-lg border border-brand-blue/20">
-                  {tab === "issue" ? "wZEC" : "ZEC"}
+                  {tab === "issue" ? wrappedCoinName() : zcashCoinName()}
                 </span>
               </div>
             </div>
@@ -668,7 +976,13 @@ export default function BridgePage() {
           {/* Submit */}
           <button
             type="submit"
-            disabled={submitting || !amount || zatoshi <= 0 || (tab === "redeem" && wzecBalance < BigInt(zatoshi))}
+            disabled={
+              submitting || 
+              !amount || 
+              zatoshi <= 0 || 
+              (tab === "redeem" && wzecBalance < BigInt(zatoshi)) ||
+              (tab === "issue" && pool !== null && BigInt(zatoshi) > pool.capacity)
+            }
             className={`w-full py-4 rounded-xl font-semibold text-lg transition-all ${
               tab === "issue"
                 ? "btn-primary"
@@ -681,9 +995,9 @@ export default function BridgePage() {
                 {statusMsg || "Processing..."}
               </span>
             ) : tab === "issue" ? (
-              "Issue wZEC"
+              `Issue ${wrappedCoinName()}`
             ) : (
-              "Redeem ZEC"
+              `Redeem ${zcashCoinName()}`
             )}
           </button>
         </form>
@@ -703,7 +1017,7 @@ export default function BridgePage() {
               ) : (
                 <Info className="h-5 w-5 text-brand-primary mt-0.5 shrink-0" />
               )}
-              <div className="text-sm text-gray-300 space-y-1 min-w-0">
+              <div className="text-sm text-gray-300 space-y-1 min-w-0 overflow-hidden">
                 {result.txHash && (
                   <div className="flex items-center gap-2 flex-wrap mb-2">
                     <span className="text-gray-400">TX:</span>
@@ -712,8 +1026,54 @@ export default function BridgePage() {
                   </div>
                 )}
                 {result.lines.map((line, i) => (
-                  <p key={i} className={line === "" ? "h-2" : ""}>{line}</p>
+                  <p key={i} className={`${line === "" ? "h-2" : ""} break-all`}>{line}</p>
                 ))}
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* Testnet Manual Send Confirmation */}
+        {pendingManualSend && !submitting && (
+          <div className="mt-4 p-4 rounded-xl border border-brand-blue/30 bg-brand-blue/5">
+            <div className="space-y-3">
+              <h3 className="text-sm font-semibold text-brand-blue flex items-center gap-2">
+                <Send className="h-4 w-4" />
+                Send {zcashCoinName()} to Complete Issue
+              </h3>
+              <div className="bg-brand-dark rounded-lg p-3 space-y-2">
+                <div>
+                  <span className="text-xs text-gray-400">Send exactly:</span>
+                  <p className="font-mono text-lg font-bold text-brand-primary">
+                    {pendingManualSend.amountZec.toFixed(8)} {zcashCoinName()}
+                  </p>
+                </div>
+                <div>
+                  <span className="text-xs text-gray-400">To vault #{pendingManualSend.vaultId + 1} address:</span>
+                  <div className="flex items-center gap-2 mt-0.5">
+                    <code className="font-mono text-xs text-brand-blue break-all">{pendingManualSend.vaultZcashAddr}</code>
+                    <CopyBtn text={pendingManualSend.vaultZcashAddr} />
+                  </div>
+                </div>
+              </div>
+              <p className="text-xs text-gray-400">
+                Send the {zcashCoinName()} from your Zcash testnet wallet, then click below to finish the issue.
+              </p>
+              <div className="flex gap-3">
+                <button
+                  onClick={handleConfirmManualSend}
+                  disabled={submitting}
+                  className="btn-primary flex items-center gap-2"
+                >
+                  <Check className="h-4 w-4" />
+                  I&apos;ve Sent the {zcashCoinName()}
+                </button>
+                <button
+                  onClick={() => { setPendingManualSend(null); setResult(null); }}
+                  className="px-4 py-2 rounded-lg text-sm text-gray-400 hover:text-gray-200 bg-white/5 hover:bg-white/10 transition-colors"
+                >
+                  Cancel
+                </button>
               </div>
             </div>
           </div>

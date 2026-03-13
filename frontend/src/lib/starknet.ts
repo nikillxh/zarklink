@@ -6,6 +6,7 @@ import { RpcProvider, Account } from "starknet";
 
 // Contract addresses — loaded from env or defaults
 export const config = {
+  network: (process.env.NEXT_PUBLIC_NETWORK ?? "devnet") as "devnet" | "testnet",
   starknetRpcUrl: process.env.NEXT_PUBLIC_STARKNET_RPC_URL ?? "http://127.0.0.1:5050",
   zcashRpcUrl: process.env.NEXT_PUBLIC_ZCASH_RPC_URL ?? "http://127.0.0.1:18232",
   bridgeAddress: process.env.NEXT_PUBLIC_BRIDGE_ADDRESS ?? "",
@@ -16,13 +17,25 @@ export const config = {
   oracleAddress: process.env.NEXT_PUBLIC_ORACLE_ADDRESS ?? "",
 };
 
+export const isTestnet = config.network === "testnet";
+export const isDevnet = config.network === "devnet";
+
+// Starknet explorer URL (Voyager for Sepolia)
+export function explorerUrl(txHashOrAddress: string, type: "tx" | "contract" = "tx"): string {
+  if (isTestnet) {
+    return `https://sepolia.voyager.online/${type}/${txHashOrAddress}`;
+  }
+  return `http://127.0.0.1:5050/explorer/${type}/${txHashOrAddress}`;
+}
+
 export function getProvider(): RpcProvider {
   return new RpcProvider({ nodeUrl: config.starknetRpcUrl });
 }
 
 export function getDevnetAccount(): Account {
   const addr = process.env.NEXT_PUBLIC_DEPLOYER_ADDRESS ?? "";
-  const key = process.env.NEXT_PUBLIC_DEPLOYER_KEY ?? "";
+  // Check both NEXT_PUBLIC_ (devnet) and server-only (testnet) key vars
+  const key = process.env.NEXT_PUBLIC_DEPLOYER_KEY ?? process.env.DEPLOYER_KEY ?? "";
   if (!addr || !key) throw new Error("Devnet account not configured");
   return new Account({ provider: getProvider(), address: addr, signer: key });
 }
@@ -257,8 +270,30 @@ export const WZEC_ABI = [
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
+/**
+ * Returns the user-facing coin name for the Zcash side of the bridge.
+ * - devnet / localhost / mainnet → "ZEC"
+ * - testnet (Sepolia) → "TAZ" (Zcash testnet coin)
+ */
+export function zcashCoinName(): string {
+  return isTestnet ? "TAZ" : "ZEC";
+}
+
+/**
+ * Returns the user-facing wrapped-coin name.
+ * - devnet / mainnet → "wZEC"
+ * - testnet → "wTAZ"
+ */
+export function wrappedCoinName(): string {
+  return isTestnet ? "wTAZ" : "wZEC";
+}
+
 export function formatZec(zatoshi: bigint): string {
-  return `${(Number(zatoshi) / 1e8).toFixed(8)} ZEC`;
+  return `${(Number(zatoshi) / 1e8).toFixed(8)} ${zcashCoinName()}`;
+}
+
+export function formatWrappedZec(zatoshi: bigint): string {
+  return `${(Number(zatoshi) / 1e8).toFixed(8)} ${wrappedCoinName()}`;
 }
 
 export function shortAddr(addr: string, len = 6): string {
@@ -312,10 +347,10 @@ export function friendlyTxError(err: unknown): { message: string; hints: string[
   // Common contract errors
   if (decoded.includes("Insufficient balance") || raw.includes("Insufficient balance")) {
     return {
-      message: "Insufficient wZEC balance for this operation.",
+      message: `Insufficient ${wrappedCoinName()} balance for this operation.`,
       hints: [
-        "Your current account doesn't have enough wZEC.",
-        "Make sure you're using the same account that received the wZEC from an Issue.",
+        `Your current account doesn't have enough ${wrappedCoinName()}.`,
+        `Make sure you're using the same account that received the ${wrappedCoinName()} from an Issue.`,
         "Check the account selector in the navbar.",
       ],
     };
@@ -329,7 +364,7 @@ export function friendlyTxError(err: unknown): { message: string; hints: string[
   if (decoded.includes("No active vaults") || raw.includes("No active vaults")) {
     return {
       message: "No active vaults available.",
-      hints: ["No vault is registered. Run: ./scripts/start-devnet.sh --services"],
+      hints: isDevnet ? ["No vault is registered. Run: ./scripts/start-devnet.sh --services"] : ["No vaults are currently registered in the bridge."],
     };
   }
   if (decoded.includes("Zero") || raw.includes("Zero")) {
@@ -341,7 +376,7 @@ export function friendlyTxError(err: unknown): { message: string; hints: string[
   if (raw.includes("CONTRACT_NOT_FOUND") || raw.includes("not deployed")) {
     return {
       message: "Contracts not deployed.",
-      hints: ["Run: ./scripts/start-devnet.sh --deploy"],
+      hints: isDevnet ? ["Run: ./scripts/start-devnet.sh --deploy"] : ["Contract addresses may be misconfigured."],
     };
   }
   if (decoded.includes("Not vault operator") || raw.includes("Not vault operator")) {

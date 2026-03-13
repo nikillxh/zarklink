@@ -25,6 +25,7 @@ import { useAccount } from "@/context/AccountContext";
 import { useWallet } from "@/context/WalletContext";
 import {
   config as starknetConfig,
+  isDevnet,
   getProvider,
   formatZec,
   shortAddr,
@@ -35,6 +36,7 @@ import {
   POOL_ABI,
   WZEC_ABI,
 } from "@/lib/starknet";
+import { notFound } from "next/navigation";
 
 // ── Types ────────────────────────────────────────────────────────────────────
 
@@ -98,6 +100,11 @@ async function findFinalizedBlock(): Promise<{ height: number; commitmentRoot: s
 // ── Page ─────────────────────────────────────────────────────────────────────
 
 export default function DevToolsPage() {
+  // Block access in non-devnet environments
+  if (!isDevnet) {
+    notFound();
+  }
+
   const { current: account, accounts, getAccount } = useAccount();
   const wallet = useWallet();
 

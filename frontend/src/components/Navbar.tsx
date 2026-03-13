@@ -2,16 +2,19 @@
 
 import Link from "next/link";
 import { usePathname } from "next/navigation";
-import { Zap, ArrowLeftRight, Shield, BarChart3, Radio, Wrench, BookOpen } from "lucide-react";
+import { Zap, ArrowLeftRight, Shield, BarChart3, Radio, Wrench, BookOpen, UserCircle } from "lucide-react";
 import WalletConnector from "@/components/WalletConnector";
+import { isDevnet } from "@/lib/starknet";
 
 const NAV_ITEMS = [
   { href: "/", label: "Dashboard", icon: BarChart3 },
   { href: "/bridge", label: "Bridge", icon: ArrowLeftRight },
   { href: "/vaults", label: "Vaults", icon: Shield },
+  { href: "/account", label: "Account", icon: UserCircle },
   { href: "/relay", label: "Relay", icon: Radio },
   { href: "/docs", label: "Docs", icon: BookOpen },
-  { href: "/dev", label: "Dev", icon: Wrench },
+  // Dev page only visible on devnet (hidden in production/testnet)
+  ...(isDevnet ? [{ href: "/dev", label: "Dev", icon: Wrench }] : []),
 ];
 
 export default function Navbar() {
@@ -50,11 +53,20 @@ export default function Navbar() {
             })}
           </div>
 
-          {/* Wallet Connection + Status */}
+          {/* Wallet Connection + Network Badge */}
           <div className="flex items-center gap-3">
             <div className="flex items-center gap-2">
-              <span className="h-2 w-2 rounded-full bg-brand-green animate-pulse" />
-              <span className="text-xs text-gray-400">Localhost</span>
+              {isDevnet ? (
+                <>
+                  <span className="h-2 w-2 rounded-full bg-brand-green animate-pulse" />
+                  <span className="text-xs text-gray-400">Devnet</span>
+                </>
+              ) : (
+                <>
+                  <span className="h-2 w-2 rounded-full bg-yellow-400 animate-pulse" />
+                  <span className="text-xs text-yellow-400 font-medium">Sepolia</span>
+                </>
+              )}
             </div>
 
             <WalletConnector />

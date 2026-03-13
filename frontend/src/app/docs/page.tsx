@@ -18,6 +18,7 @@ import {
   Wrench,
 } from "lucide-react";
 import Link from "next/link";
+import { isDevnet } from "@/lib/starknet";
 
 // ── Collapsible Section ──────────────────────────────────────────────────────
 
@@ -126,10 +127,12 @@ export default function DocsPage() {
               </div>
             ))}
 
-            <div className="mt-3 text-xs text-gray-500">
-              On devnet, all roles are pre-configured: accounts 1-8 are vault operators, account 9 is the Issuer (Alice),
-              account 10 is the Redeemer (Dave), account 11 is the Relayer, account 12 is the Oracle.
-            </div>
+            {isDevnet && (
+              <div className="mt-3 text-xs text-gray-500">
+                On devnet, all roles are pre-configured: accounts 1-8 are vault operators, account 9 is the Issuer (Alice),
+                account 10 is the Redeemer (Dave), account 11 is the Relayer, account 12 is the Oracle.
+              </div>
+            )}
           </div>
         </Section>
 
@@ -340,10 +343,21 @@ export default function DocsPage() {
             <div>
               <h3 className="text-sm font-medium text-foreground mb-2">Prerequisites</h3>
               <ul className="text-xs text-gray-400 space-y-1 list-disc list-inside">
-                <li>Devnet running: <code className="text-gray-300">./scripts/start-devnet.sh --full-stack</code></li>
-                <li>Contracts deployed (done automatically with --full-stack)</li>
-                <li>At least one vault registered and funded (done automatically)</li>
-                <li>Relayer running to submit Zcash headers (done automatically with --services)</li>
+                {isDevnet ? (
+                  <>
+                    <li>Devnet running: <code className="text-gray-300">./scripts/start-devnet.sh --full-stack</code></li>
+                    <li>Contracts deployed (done automatically with --full-stack)</li>
+                    <li>8 vaults registered with varying collateral (done automatically with --full-stack or --script0)</li>
+                    <li>Relayer running to submit Zcash headers (done automatically with --services)</li>
+                    <li className="mt-1 text-gray-500">Quick-start flags: <code className="text-gray-300">--full-infra</code> (deploy + 8 vaults + services), <code className="text-gray-300">--full-stack</code> (full-infra + simulation)</li>
+                  </>
+                ) : (
+                  <>
+                    <li>A Starknet wallet (e.g. Argent X or Braavos) connected to Sepolia testnet</li>
+                    <li>STRK tokens for gas fees (use a Sepolia faucet)</li>
+                    <li>At least one vault must be registered and funded in the pool</li>
+                  </>
+                )}
               </ul>
             </div>
 
@@ -357,7 +371,7 @@ export default function DocsPage() {
                 </div>
                 <div className="flex gap-3 items-start text-xs text-gray-400">
                   <span className="font-mono bg-brand-primary/10 text-brand-primary rounded px-1.5 py-0.5 text-[10px] flex-shrink-0">2</span>
-                  <span>Select <strong className="text-gray-300">Issuer (Alice)</strong> from the account dropdown (account #9)</span>
+                  <span>{isDevnet ? 'Select Issuer (Alice) from the account dropdown (account #9)' : 'Connect your Starknet wallet'}</span>
                 </div>
                 <div className="flex gap-3 items-start text-xs text-gray-400">
                   <span className="font-mono bg-brand-primary/10 text-brand-primary rounded px-1.5 py-0.5 text-[10px] flex-shrink-0">3</span>
@@ -388,7 +402,7 @@ export default function DocsPage() {
                 </div>
                 <div className="flex gap-3 items-start text-xs text-gray-400">
                   <span className="font-mono bg-brand-secondary/10 text-brand-secondary rounded px-1.5 py-0.5 text-[10px] flex-shrink-0">2</span>
-                  <span>Use the same account that has wZEC (Issuer Alice after an Issue)</span>
+                  <span>{isDevnet ? 'Use the same account that has wZEC (Issuer Alice after an Issue)' : 'Ensure you have wZEC in your connected wallet from a previous Issue'}</span>
                 </div>
                 <div className="flex gap-3 items-start text-xs text-gray-400">
                   <span className="font-mono bg-brand-secondary/10 text-brand-secondary rounded px-1.5 py-0.5 text-[10px] flex-shrink-0">3</span>
@@ -408,14 +422,27 @@ export default function DocsPage() {
             {/* Dev Tips */}
             <div className="bg-yellow-500/5 border border-yellow-500/20 rounded-lg p-4">
               <h4 className="text-sm font-medium text-yellow-400 mb-2 flex items-center gap-2">
-                <AlertTriangle className="h-4 w-4" /> Developer Notes
+                <AlertTriangle className="h-4 w-4" /> {isDevnet ? 'Developer Notes' : 'Important Notes'}
               </h4>
               <ul className="text-xs text-yellow-400/70 space-y-1 list-disc list-inside">
-                <li>On devnet, the frontend auto-completes all steps (including vault operator actions).</li>
-                <li>In production, the vault daemon would handle Steps 2-3 of Issue and Step 2 of Redeem.</li>
+                {isDevnet ? (
+                  <>
+                    <li>On devnet, the frontend auto-completes all steps (including vault operator actions).</li>
+                    <li>In production, the vault daemon would handle Steps 2-3 of Issue and Step 2 of Redeem.</li>
+                    <li>Use <code className="text-yellow-400">--full-stack</code> to launch with 8 vaults (varying collateral) + simulated bridge activity.</li>
+                    <li>Use <code className="text-yellow-400">--script0</code> to set up vaults and fund accounts independently, or <code className="text-yellow-400">--script1</code> to simulate issues/redeems/slashing.</li>
+                    <li>You can simulate additional transactions using the <Link href="/dev" className="text-yellow-400 hover:underline">Dev Tools</Link> page.</li>
+                    <li>Direct wZEC minting (for testing redeems) is available on the Dev Tools page.</li>
+                    <li>Push to production: <code className="text-yellow-400">./scripts/push-to-prod.sh</code> deploys to Vercel + optionally redeploys contracts with <code className="text-yellow-400">--contracts</code>.</li>
+                  </>
+                ) : (
+                  <>
+                    <li>The vault daemon handles Steps 2-3 of Issue and Step 2 of Redeem automatically.</li>
+                    <li>The relayer must be running with finalized blocks for the bridge to work.</li>
+                    <li>This is running on Starknet Sepolia testnet — no real ZEC is involved.</li>
+                  </>
+                )}
                 <li>The relayer must be running with finalized blocks for the bridge to work.</li>
-                <li>You can simulate multiple transactions using the <Link href="/dev" className="text-yellow-400 hover:underline">Dev Tools</Link> page.</li>
-                <li>Direct wZEC minting (for testing redeems) is available on the Dev Tools page.</li>
               </ul>
             </div>
           </div>
@@ -471,10 +498,10 @@ export default function DocsPage() {
         {/* ── Troubleshooting ─────────────────────────────────────── */}
         <Section title="Troubleshooting" icon={AlertTriangle}>
           <div className="mt-4 space-y-3">
-            {[
+            {(isDevnet ? [
               {
                 q: "\"No active vaults in pool\"",
-                a: "No vault is registered. Run: ./scripts/start-devnet.sh --services"
+                a: "No vault is registered. Run: ./scripts/start-devnet.sh --full-infra (deploys 8 vaults with varying collateral)"
               },
               {
                 q: "\"Insufficient wZEC balance\"",
@@ -482,11 +509,15 @@ export default function DocsPage() {
               },
               {
                 q: "\"No finalized blocks in relay\"",
-                a: "The relayer hasn't submitted enough headers. Start the relayer: ./scripts/start-devnet.sh --services"
+                a: "The relayer hasn't submitted enough headers. Start the relayer: ./scripts/start-devnet.sh --services (or use --full-infra which seeds 30+ headers)"
               },
               {
                 q: "\"Contract not found\"",
                 a: "Contracts aren't deployed. Run: ./scripts/start-devnet.sh --deploy then restart the frontend."
+              },
+              {
+                q: "\"No funds available\" or \"Funding failed\"",
+                a: "Mine at least 101 blocks first (coinbase needs 100 confirmations). Use Dev Tools → Mine Blocks, or the fund_z_address API auto-falls back to shielded balances."
               },
               {
                 q: "Balances not updating",
@@ -496,7 +527,28 @@ export default function DocsPage() {
                 q: "Zcash balance shows \"—\"",
                 a: "zcashd is not running or the API route can't reach it. Check: curl http://127.0.0.1:18232 and ensure ZCASH_RPC_USER/PASS are in frontend/.env.local"
               },
-            ].map(({ q, a }) => (
+            ] : [
+              {
+                q: "\"No active vaults in pool\"",
+                a: "No vault is registered yet. Vaults need to register and deposit collateral before the bridge can process requests."
+              },
+              {
+                q: "\"Insufficient wZEC balance\"",
+                a: "You're trying to redeem from a wallet with no wZEC. You first need to complete an Issue to receive wZEC."
+              },
+              {
+                q: "\"No finalized blocks in relay\"",
+                a: "The relayer hasn't submitted enough headers yet. Block headers need 6 confirmations for finality."
+              },
+              {
+                q: "Wallet not connecting",
+                a: "Make sure your wallet (Argent X or Braavos) is set to Starknet Sepolia network. Refresh the page and try again."
+              },
+              {
+                q: "Transaction failing",
+                a: "Ensure you have enough STRK for gas fees. You can get test STRK from the Starknet Sepolia faucet."
+              },
+            ]).map(({ q, a }) => (
               <div key={q} className="bg-white/5 rounded-lg p-3 border border-brand-border">
                 <div className="text-xs font-medium text-red-400 mb-1">{q}</div>
                 <div className="text-xs text-gray-400">{a}</div>
@@ -508,7 +560,7 @@ export default function DocsPage() {
         {/* ── Links ───────────────────────────────────────────────── */}
         <div className="card p-5">
           <h2 className="text-lg font-semibold mb-3">Quick Links</h2>
-          <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+          <div className={`grid grid-cols-2 ${isDevnet ? 'sm:grid-cols-4' : 'sm:grid-cols-3'} gap-3`}>
             <Link href="/bridge" className="text-sm text-center bg-white/5 hover:bg-white/10 rounded-lg p-3 border border-brand-border transition-colors">
               <ArrowLeftRight className="h-5 w-5 mx-auto mb-1 text-brand-primary" />
               Bridge
@@ -521,10 +573,12 @@ export default function DocsPage() {
               <Radio className="h-5 w-5 mx-auto mb-1 text-blue-400" />
               Relay
             </Link>
+            {isDevnet && (
             <Link href="/dev" className="text-sm text-center bg-white/5 hover:bg-white/10 rounded-lg p-3 border border-brand-border transition-colors">
               <Wrench className="h-5 w-5 mx-auto mb-1 text-green-400" />
               Dev Tools
             </Link>
+            )}
           </div>
         </div>
       </div>

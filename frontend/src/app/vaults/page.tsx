@@ -12,7 +12,7 @@ import {
 import StatCard from "@/components/StatCard";
 import { useVaultList, usePoolStats } from "@/hooks/useStarknet";
 import { useAccount } from "@/context/AccountContext";
-import { formatZec, shortAddr, vaultStatusLabel } from "@/lib/starknet";
+import { formatZec, shortAddr, vaultStatusLabel, zcashCoinName } from "@/lib/starknet";
 
 export default function VaultsPage() {
   const { vaults, loading: vaultsLoading, refetch: refetchVaults } = useVaultList(15000);
@@ -33,7 +33,7 @@ export default function VaultsPage() {
     try {
       const signer = getAccount();
       if (!signer) {
-        alert("No account selected. Pick a devnet account from the navbar.");
+        alert("No wallet connected. Connect your wallet from the navbar.");
         return;
       }
       // Simulated — would call vault_registry.register_vault with selected account
@@ -85,8 +85,9 @@ export default function VaultsPage() {
           icon={Users}
         />
         <StatCard
-          title="Pool Capacity"
-          value={pool ? formatZec(pool.capacity) : "—"}
+          title="Total Deposited"
+          value={pool ? formatZec(pool.totalDeposited) : "—"}
+          subtitle={pool ? `${formatZec(pool.capacity)} available` : ""}
           icon={ArrowDownCircle}
         />
       </div>
@@ -98,7 +99,7 @@ export default function VaultsPage() {
           <form onSubmit={handleRegister} className="space-y-4">
             <div>
               <label className="text-sm text-gray-400 mb-1 block">
-                Collateral Amount (ZEC)
+                Collateral Amount ({zcashCoinName()})
               </label>
               <input
                 type="number"
@@ -110,7 +111,7 @@ export default function VaultsPage() {
                 className="input-field w-full font-mono"
               />
               <p className="text-xs text-gray-500 mt-1">
-                Minimum 1 ZEC. Collateral ratio: 150%
+                Minimum 1 {zcashCoinName()}. Collateral ratio: 150%
               </p>
             </div>
             <div>
@@ -158,7 +159,7 @@ export default function VaultsPage() {
             <Shield className="h-12 w-12 text-gray-600 mx-auto mb-3" />
             <p className="text-gray-400">No vaults registered yet</p>
             <p className="text-sm text-gray-500 mt-1">
-              Deploy contracts and register the first vault
+              Be the first to register a vault and earn bridge fees
             </p>
           </div>
         ) : (
@@ -170,7 +171,7 @@ export default function VaultsPage() {
                   <th className="text-left py-3 px-2 text-gray-400 font-medium">Owner</th>
                   <th className="text-left py-3 px-2 text-gray-400 font-medium">Status</th>
                   <th className="text-right py-3 px-2 text-gray-400 font-medium">Collateral</th>
-                  <th className="text-right py-3 px-2 text-gray-400 font-medium">Ratio</th>
+                  <th className="text-right py-3 px-2 text-gray-400 font-medium">Pool %</th>
                   <th className="text-right py-3 px-2 text-gray-400 font-medium">Issued</th>
                   <th className="text-right py-3 px-2 text-gray-400 font-medium">Redeemed</th>
                 </tr>
@@ -196,7 +197,9 @@ export default function VaultsPage() {
                         {formatZec(v.collateral)}
                       </td>
                       <td className="py-3 px-2 text-right">
-                        {(v.collateralRatio / 100).toFixed(0)}%
+                        {v.poolShare > 0 
+                          ? `${v.poolShare.toFixed(2)}%` 
+                          : "—"}
                       </td>
                       <td className="py-3 px-2 text-right font-mono text-gray-400">
                         {formatZec(v.totalIssued)}

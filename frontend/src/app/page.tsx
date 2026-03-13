@@ -12,16 +12,29 @@ import {
   Eye,
 } from "lucide-react";
 import StatCard from "@/components/StatCard";
-import { useBridgeStats, useRelayStats, usePoolStats, useWzecBalance } from "@/hooks/useStarknet";
+import { useBridgeStats, useRelayStats, usePoolStats, useWzecBalance, useZcashBalance } from "@/hooks/useStarknet";
 import { useAccount } from "@/context/AccountContext";
-import { formatZec, shortAddr } from "@/lib/starknet";
+import { useWallet } from "@/context/WalletContext";
+import { useZcashAccount } from "@/context/ZcashAccountContext";
+import { formatZec, formatWrappedZec, shortAddr, zcashCoinName, wrappedCoinName } from "@/lib/starknet";
 
 export default function Dashboard() {
   const { stats: bridge, loading: bridgeLoading } = useBridgeStats();
   const { stats: relay, loading: relayLoading } = useRelayStats();
   const { stats: pool, loading: poolLoading } = usePoolStats();
   const { current: account } = useAccount();
-  const { balance: wzecBalance, loading: wzecLoading } = useWzecBalance(account?.address ?? "");
+  const wallet = useWallet();
+  const { getZcashAddress } = useZcashAccount();
+
+  // Resolve the active Starknet address (devnet account or browser wallet)
+  const activeAddress = wallet.address ?? account?.address ?? "";
+
+  // Resolve the Zcash address: devnet uses mapped address, testnet/mainnet uses association
+  const associatedZcash = activeAddress ? getZcashAddress(activeAddress) : null;
+  const zcashAddr = account?.zcash_shielded ?? associatedZcash ?? "";
+
+  const { balance: wzecBalance, loading: wzecLoading } = useWzecBalance(activeAddress, 15000);
+  const { balance: zecBalance, loading: zecLoading } = useZcashBalance(zcashAddr, 15000);
 
   return (
     <div className="mx-auto max-w-7xl px-4 sm:px-6 lg:px-8 py-12">
@@ -39,28 +52,40 @@ export default function Dashboard() {
           <span className="text-gradient">Starknet</span>
         </h1>
         <p className="text-gray-400 text-lg max-w-2xl mx-auto">
-          Bridge ZEC to wZEC on Starknet with STARK proof verification,
+          Bridge {zcashCoinName()} to {wrappedCoinName()} on Starknet with STARK proof verification,
           vault pool aggregation, and privacy-preserving amount splitting.
         </p>
       </div>
 
       {/* Account Banner */}
-      {account && (
+      {(account || wallet.isConnected) && (
         <div className="flex items-center gap-4 mb-6 p-3 rounded-xl bg-brand-card border border-brand-border">
           <div className="flex items-center gap-2">
             <div className="h-6 w-6 rounded-full bg-gradient-to-br from-brand-primary to-brand-blue flex items-center justify-center text-[10px] font-bold text-white">
-              {account.label.charAt(0)}
+              {(account?.label ?? wallet.walletKind).charAt(0).toUpperCase()}
             </div>
             <div>
-              <span className="text-xs text-gray-400">{account.label}</span>
-              <span className="font-mono text-xs text-gray-500 ml-2">{shortAddr(account.address)}</span>
+              <span className="text-xs text-gray-400">
+                {account?.label ?? (wallet.walletKind !== "unknown" ? wallet.walletKind : "Wallet")}
+              </span>
+              <span className="font-mono text-xs text-gray-500 ml-2">{shortAddr(activeAddress)}</span>
             </div>
           </div>
-          <div className="ml-auto text-right">
-            <span className="text-xs text-gray-400">wZEC Balance</span>
-            <p className="font-mono text-sm text-foreground">
-              {wzecLoading ? "..." : formatZec(wzecBalance)}
-            </p>
+          <div className="ml-auto flex items-center gap-6">
+            {/* ZEC / TAZ Balance */}
+            <div className="text-right">
+              <span className="text-xs text-gray-400">{zcashCoinName()} Balance</span>
+              <p className="font-mono text-sm text-foreground">
+                {!zcashAddr ? "—" : zecLoading ? "..." : `${zecBalance} ${zcashCoinName()}`}
+              </p>
+            </div>
+            {/* wZEC / wTAZ Balance */}
+            <div className="text-right">
+              <span className="text-xs text-gray-400">{wrappedCoinName()} Balance</span>
+              <p className="font-mono text-sm text-foreground">
+                {wzecLoading ? "..." : formatWrappedZec(wzecBalance)}
+              </p>
+            </div>
           </div>
         </div>
       )}
@@ -109,8 +134,8 @@ export default function Dashboard() {
             <h3 className="text-lg font-semibold">Bridge</h3>
           </div>
           <p className="text-gray-400 text-sm leading-relaxed">
-            Issue wZEC by locking ZEC on mainchain, or redeem ZEC by burning
-            wZEC. Privacy-preserving splitting across multiple vaults.
+            Issue {wrappedCoinName()} by locking {zcashCoinName()} on mainchain, or redeem {zcashCoinName()} by burning
+            {wrappedCoinName()}. Privacy-preserving splitting across multiple vaults.
           </p>
           <div className="mt-4 flex items-center gap-2 text-brand-primary text-sm font-medium">
             <span>Start bridging</span>

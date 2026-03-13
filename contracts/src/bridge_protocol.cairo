@@ -504,6 +504,10 @@ pub mod BridgeProtocol {
       let wzec = self.wzec_token_dispatcher();
       wzec.mint(request.issuer, minted_amount);
 
+      // Update vault's total_issued in registry
+      let registry = self.vault_registry_dispatcher();
+      registry.record_issue(request.vault_id, request.mint_amount);
+
       // Return warranty collateral to issuer
       self.warranty_balances.write(request_id, 0);
 
@@ -649,6 +653,10 @@ pub mod BridgeProtocol {
       // Update state
       request.state = RedeemState::RedeemSuccess;
       self.redeem_requests.write(request_id, request);
+
+      // Update vault's total_redeemed in registry
+      let registry = self.vault_registry_dispatcher();
+      registry.record_redeem(request.vault_id, request.burn_amount);
 
       // Return warranty collateral to redeemer
       self.warranty_balances.write(request_id, 0);

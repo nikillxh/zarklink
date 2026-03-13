@@ -9,7 +9,7 @@ import React, {
   type ReactNode,
 } from "react";
 import { Account } from "starknet";
-import { getProvider, shortAddr } from "@/lib/starknet";
+import { getProvider, shortAddr, isDevnet } from "@/lib/starknet";
 
 // ── Types ────────────────────────────────────────────────────────────────────
 
@@ -68,7 +68,7 @@ export function AccountProvider({ children }: { children: ReactNode }) {
   // If env var parsing failed (empty), try loading from the static JSON file
   // that start-devnet.sh writes to frontend/public/devnet-accounts.json
   React.useEffect(() => {
-    if (accounts.length > 0) return;
+    if (accounts.length > 0 || !isDevnet) return;
     fetch("/devnet-accounts.json")
       .then((r) => (r.ok ? r.json() : []))
       .then((data) => {

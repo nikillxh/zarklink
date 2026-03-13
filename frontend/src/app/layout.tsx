@@ -4,6 +4,8 @@ import Navbar from "@/components/Navbar";
 import Footer from "@/components/Footer";
 import { AccountProvider } from "@/context/AccountContext";
 import { WalletProvider } from "@/context/WalletContext";
+import { BridgeProvider } from "@/context/BridgeContext";
+import { ZcashAccountProvider } from "@/context/ZcashAccountContext";
 import "./globals.css";
 
 const geistSans = localFont({
@@ -20,6 +22,18 @@ const geistMono = localFont({
 export const metadata: Metadata = {
   title: "Zarklink — Zcash ↔ Starknet Bridge",
   description: "Privacy-preserving bridge between Zcash and Starknet using STARK proofs and the Vault Pool Model.",
+  openGraph: {
+    title: "Zarklink — Zcash ↔ Starknet Bridge",
+    description: "Privacy-preserving bridge between Zcash and Starknet using STARK proofs and the Vault Pool Model.",
+    url: "https://zarklink.vercel.app",
+    siteName: "Zarklink",
+    type: "website",
+  },
+  twitter: {
+    card: "summary",
+    title: "Zarklink — Zcash ↔ Starknet Bridge",
+    description: "Privacy-preserving bridge between Zcash and Starknet using STARK proofs and the Vault Pool Model.",
+  },
 };
 
 export default function RootLayout({
@@ -34,9 +48,13 @@ export default function RootLayout({
       >
         <AccountProvider>
           <WalletProvider>
-            <Navbar />
-            <main className="flex-1">{children}</main>
-            <Footer />
+            <ZcashAccountProvider>
+              <BridgeProvider>
+                <Navbar />
+                <main className="flex-1">{children}</main>
+                <Footer />
+              </BridgeProvider>
+            </ZcashAccountProvider>
           </WalletProvider>
         </AccountProvider>
       </body>
